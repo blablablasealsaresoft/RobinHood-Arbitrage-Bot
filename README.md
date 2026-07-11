@@ -1,158 +1,297 @@
-# 🤖 RobinArb
+# RobinHood Arbitrage Bot
 
-> 🇮🇩 Versi Bahasa Indonesia: **[README.id.md](README.id.md)**
+> Indonesian documentation: [README.id.md](README.id.md)
 
-**Atomic arbitrage bot for Robinhood Chain** (chainId `4663`) — trades the gap between
-a token's **RobinFun bonding curve** and its **Uniswap V4 pool**, in a single
-**profit‑or‑revert** transaction.
+Atomic arbitrage between a configured RobinFun bonding-curve manager and Uniswap V4 on Robinhood Chain (`chainId 4663`). The bot quotes both directions:
 
-| Dir | Route | Fires when |
-|:--:|---|---|
-| 🅐 | 🟢 buy **curve** → 🔴 sell **V4** | V4 pumped **above** the curve |
-| 🅑 | 🟢 buy **V4** → 🔴 sell **curve** | V4 dumped **below** the curve |
+| Direction | Route |
+|---|---|
+| A | buy on the curve, sell on V4 |
+| B | buy on V4, sell on the curve |
 
-⚙️ Auto‑discovers every token with an active curve **and** a liquid V4 pool, watches
-them event‑driven, sizes each trade optimally, and only fires when the net edge
-(after the 1% curve fee, the V4 pool fee, slippage & gas) clears the gate.
+Live trading requires the deployed `ArbExecutor`. Both legs execute in one transaction. The executor reverts unless its ETH balance increases by the requested gross profit floor, which includes the bot's configured net target and bounded maximum gas cost. A reverted transaction still costs gas.
 
----
+This software does not guarantee profit. It is designed to reject unprofitable or unsupported trades.
 
-## 📖 How it works — operator playbook
+## Supported market scope
 
-> 🎯 **You create the arbitrage venue; the bot captures it automatically.**
+The scanner currently considers markets that satisfy all of these conditions:
 
-### 1️⃣ Find a curve token
-Browse **[robinfun.live](https://robinfun.live)** → pick one with **≥ 10% bonding
-progress** (enough curve depth to trade against).
+- The pool belongs to the configured Uniswap V4 PoolManager.
+- `currency0` is native ETH and `currency1` is the token.
+- The token has an active, non-graduated curve on the single RobinFun manager in `config.js`.
+- The pool has active liquidity according to V4 StateView.
+- The pool has no hooks.
+- Its fee and tick spacing pass validation.
 
-### 2️⃣ Create its Uniswap V4 pool
-Add a pool for that token with a **25% base fee**, and set the **initial price = the
-token's current bonding‑curve price** — so the pool starts aligned (no free loss).
+The bot does not cover other RobinFun factory versions, hook-enabled pools, non-native pairs, or other DEXes. A market passing the scanner is only technically eligible. The trading loop still requires a positive quote after fees, conservative slippage, price impact, and bounded gas.
 
-### 3️⃣ Trigger / seed the pool
-Copy the token's **contract address** → paste into
-**[trigerpool.vercel.app](https://trigerpool.vercel.app)** → connect wallet → leave
-settings on **default** → click **Swap**. This initializes the pool + emits its first
-on‑chain Swap.
+## Safety model
 
-### 4️⃣ Review and allowlist the pool
-RobinArb's real‑time listener watches the V4 PoolManager `Initialize` event. The
-listener detects new pools, but they **cannot be traded until reviewed and allowlisted
-on-chain**. Run `npm run scan`, inspect `watchlist.json`, then run
-`npm run allow-pools`. Separating discovery from permission prevents an untrusted pool
-from gaining immediate access to the executor.
+- Live mode is atomic-only. The unsafe two-transaction EOA path is disabled.
+- Every PoolKey requires an on-chain allowlist entry.
+- Newly discovered pools never receive permission automatically.
+- The executor enforces a maximum trade size and rejects hook-enabled pools.
+- The contract uses token balance deltas, safe ERC-20 calls, a reentrancy guard, two-step ownership transfer, and a pause switch.
+- The bot serializes scans and execution to prevent overlapping trades and nonce races.
+- Explicit gas and fee ceilings make the successful-trade profit floor conservative.
+- PM2 restarts failed processes, while transient RPC event errors are retried or ignored safely.
 
-> ⚡ **TL;DR** — pick a ≥10% bonded token → make its 25% V4 pool at the curve price →
-> trigger once → review → allowlist → the bot arbs it automatically. 💰
+## Requirements
 
----
+- Node.js 20 or newer
+- npm
+- A dedicated wallet funded with Robinhood Chain ETH
+- A private Robinhood Chain RPC is recommended for live operation
+- PM2 for continuous operation
 
-## ⚛️ How it trades (atomic)
+Do not use a primary wallet. Never commit `.env`.
 
-`contracts/ArbExecutor.sol` holds the working capital and does buy+sell in **one tx**
-that **reverts unless the contract's ETH balance grows by `minProfit`**. The bot adds
-the transaction's bounded maximum gas charge to that floor, so a successful trade
-still clears the configured net target. A revert still costs gas but leaves no inventory.
+## Install on Windows
 
-- 🅐 `curveToV4(token, ethIn, minTokensOut, key, minEthOut, minProfit)` — dir A
-- 🅑 `v4ToCurve(token, ethIn, minTokensOut, key, minEthOut, minProfit)` — dir B
-- 🛡️ pools are allowlisted, hook-enabled pools are disabled, and trade size is capped on-chain
-- 🔑 `withdraw` / `rescueToken` / two-step ownership transfer — owner only
-
-## Setup
-
-```bash
+```powershell
 npm install
-cp .env.example .env      # fill PRIVATE_KEY, EXEC_RPC_URL, Telegram; leave EXECUTOR_ADDR blank for now
+Copy-Item .env.example .env
+npm run check
 ```
 
-RPC (optional): works out of the box on the **public Robinhood RPC** (already set in
-`.env.example`), with a **built-in DNS-block bypass** (Cloudflare IP pin + DoH) for
-ISPs that block `*.robinhood.com` — no VPN. For more reliable execution you can
-**optionally** point `EXEC_RPC_URL` at a private Alchemy endpoint — get one free at
-**https://dashboard.alchemy.com** (create an app for Robinhood Chain).
+Fill at least these values in `.env`:
 
-## Deploy + fund the contract
+```env
+PRIVATE_KEY=0x...
+EXECUTOR_ADDR=
+LIVE=0
 
-```bash
-npm run build:contract                 # compile -> build/ArbExecutor.json
-npm run deploy                         # deploy ArbExecutor, prints the address
-# put the printed address in .env as EXECUTOR_ADDR, then:
-AMOUNT_ETH=0.006 npm run deposit        # fund working capital (>= MAX_SIZE_ETH)
-npm run scan                            # inspect watchlist.json
-npm run allow-pools                     # explicitly permit reviewed pools
-npm run pause                           # emergency on-chain circuit breaker
-npm run unpause                         # resume after review
+EXEC_RPC_URL=https://robinhood-mainnet.g.alchemy.com/v2/YOUR_KEY
+RPC_URL=
+
+WATCHLIST=1
+MIN_SIZE_ETH=0.002
+MAX_SIZE_ETH=0.005
+MIN_PROFIT_BPS=150
+SLIPPAGE_BPS=100
+GAS_UNITS=700000
+GAS_BUFFER_BPS=12000
 ```
 
-## Withdraw
+RPC selection works as follows:
 
-```bash
-npm run withdraw                       # withdraw everything to the owner wallet
-LEAVE_ETH=0.006 npm run withdraw        # withdraw all but 0.006 (keep trading capital)
-AMOUNT_ETH=0.01 npm run withdraw        # withdraw an exact amount
+- Trading uses `EXEC_RPC_URL` when configured.
+- Monitoring uses `RPC_URL`, then falls back to `EXEC_RPC_URL`, then to the built-in pinned public provider.
+- Scheduled scanning uses `SCAN_RPC_URL`; when blank, it uses the pinned public provider so historical log reads do not consume the trading RPC quota.
+
+`RPC_URL` and `EXEC_RPC_URL` may point to the same private Alchemy endpoint.
+
+## Deploy the executor
+
+Deployment is a one-time operation for each executor version:
+
+```powershell
+npm run build:contract
+npm run deploy
 ```
 
-## Run
+Copy the printed contract address into `.env`:
 
-```bash
-npm run scan            # discover arbitrable tokens -> watchlist.json
-npm run monitor        # dry-run: watch spreads, no trading
-npm run smoke          # read-only RPC, ABI, dependency, and quote validation
-npm run live            # live atomic trading (needs funded contract + EXECUTOR_ADDR)
-npm run snapshot       # one-off econ snapshot across the watchlist
+```env
+EXECUTOR_ADDR=0x...
 ```
 
-24/7 with pm2:
+The deployment starts with no allowed pools. Existing deployments from the original RobinArb contract are not ABI-compatible with this hardened executor.
 
-```bash
-pm2 start ecosystem.config.cjs && pm2 save && pm2 startup
+## Discover and review markets
+
+These commands are read-only on-chain:
+
+```powershell
+npm run scan
+npm run smoke
+npm run snapshot -- 0.002
+```
+
+`scan` writes `watchlist.json` and an ignored incremental cache. A cold scan reads historical `Initialize` events once. Later scans read only a reorg overlap and new blocks.
+
+The scan summary distinguishes raw pool discovery from eligible markets. `Added: none` means no new pool passed every filter; raw V4 pools may still have been created.
+
+Review `watchlist.json` immediately before granting permissions. Then run:
+
+```powershell
+npm run allow-pools
+```
+
+This command sends on-chain transactions. It skips PoolKeys and tokens already approved, so rerunning it does not intentionally pay for duplicate permissions.
+
+After allowing a new pool, reload the trading process:
+
+```powershell
+pm2 restart robinarb --update-env
+pm2 save
+```
+
+Scanner removal does not revoke an existing on-chain permission. The bot stops loading removed pools after restart, but the executor permission remains until explicitly revoked at contract level.
+
+## Fund and withdraw
+
+Deposit `0.01 ETH`:
+
+```powershell
+$env:AMOUNT_ETH="0.01"
+npm run deposit
+Remove-Item Env:AMOUNT_ETH
+```
+
+Withdraw everything:
+
+```powershell
+npm run withdraw
+```
+
+Withdraw an exact amount:
+
+```powershell
+$env:AMOUNT_ETH="0.005"
+npm run withdraw
+Remove-Item Env:AMOUNT_ETH
+```
+
+The executor balance is working capital. `MAX_SIZE_ETH` remains the maximum size per trade.
+
+## Run the bot
+
+One-time dry run:
+
+```powershell
+npm run monitor:once
+```
+
+Continuous dry run:
+
+```powershell
+npm run monitor
+```
+
+Foreground live mode:
+
+```powershell
+npm run live
+```
+
+`npm run live` can submit transactions. It requires a funded, unpaused executor owned by `PRIVATE_KEY`, at least one allowlisted watchlist pool, and matching chain configuration.
+
+## PM2 operation
+
+`ecosystem.config.cjs` defines two processes:
+
+| Process | Responsibility |
+|---|---|
+| `robinarb` | quote markets and execute allowed atomic trades |
+| `robinarb-scanner` | run the incremental read-only scanner at startup and every 30 minutes |
+
+Start or reload both:
+
+```powershell
+pm2 startOrReload ecosystem.config.cjs --update-env
+pm2 save
+pm2 status
+```
+
+Logs:
+
+```powershell
 pm2 logs robinarb
 pm2 logs robinarb-scanner
 ```
 
-PM2 runs two processes: `robinarb` for continuous monitoring/trading and
-`robinarb-scanner` for an incremental scan at startup and every six hours. Configure
-the cadence with `SCAN_INTERVAL_MS`. Scanning is read-only; smoke testing, pool
-permissions, and deposits remain manual. After allowing a new pool, run
-`pm2 restart robinarb --update-env` so the bot reloads the watchlist.
+PM2 reloads `.env` only when the process restarts. Set `LIVE=1`, then run `pm2 restart robinarb --update-env` to enable live mode. On Windows, `pm2 save` stores the process list; use `pm2 resurrect` after reboot unless a separate Windows startup task has been configured.
 
-## Files
+Emergency stop:
 
-| File | Purpose |
+```powershell
+npm run pause
+pm2 stop robinarb
+```
+
+Resume after review:
+
+```powershell
+npm run unpause
+pm2 restart robinarb --update-env
+```
+
+## Telegram alerts
+
+Set:
+
+```env
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+TELEGRAM_POLL_ALERTS=1
+TELEGRAM_SCAN_ALERTS=1
+```
+
+The bot reports startup, each configured poll, idle and negative spreads, eligible opportunities, successful trades, execution errors, scheduled scan summaries, added and removed markets, scanner failures, pool permissions, deposits, withdrawals, pause, and unpause.
+
+Polling alerts can be noisy. Set `TELEGRAM_POLL_ALERTS=0` to disable them without disabling trade and scanner alerts. Telegram requests have a timeout and never block trading permanently.
+
+## Main configuration
+
+| Variable | Purpose |
 |---|---|
-| `arb.js` | main bot: discover, quote both directions, optimal size, fire atomic |
-| `scanner.js` | on-chain discovery of curve+V4 tokens -> watchlist.json |
-| `snapshot.js` | econ snapshot across the watchlist |
-| `discover.mjs` | verify curve state / PoolKey / V4 liquidity on-chain |
-| `provider.js` | ethers provider with DNS-block bypass + concurrency/backoff |
-| `config.js` | verified on-chain addresses (factory, V4 infra, PoolKeys) |
-| `abis.js` | curve ABI + Universal Router V4 swap encoder |
-| `telegram.js` | real-time trade notifications |
-| `contracts/ArbExecutor.sol` | atomic profit-or-revert executor |
-| `deploy.js` / `deposit.js` / `withdraw.js` | contract lifecycle |
-| `allow-pools.js` | explicit on-chain permission for reviewed pools |
-| `test/` | deterministic risk, PoolKey, and contract compile tests |
+| `LIVE` | `1` enables live trading for PM2; `npm run live` forces live and monitor commands force dry-run |
+| `WATCHLIST` | load supported markets from `watchlist.json` |
+| `MIN_SIZE_ETH`, `MAX_SIZE_ETH` | geometric probe boundaries and per-trade size range |
+| `GRID_POINTS` | number of geometric probe sizes per direction |
+| `MIN_PROFIT_BPS` | required net profit after the bounded gas reserve |
+| `SLIPPAGE_BPS` | conservative first-leg token floor |
+| `GAS_UNITS` | hard transaction gas limit and profit-reserve basis |
+| `GAS_BUFFER_BPS` | fee-per-gas ceiling buffer; `12000` means 20% |
+| `POLL_MS` | fallback market polling interval |
+| `EVENT_POLL_MS` | provider log polling cadence |
+| `RPC_URL`, `EXEC_RPC_URL` | monitoring and execution RPC endpoints |
+| `SCAN_RPC_URL` | optional scanner-specific RPC |
+| `SCAN_INTERVAL_MS` | PM2 scanner interval; default `1800000` (30 minutes) |
+| `SCAN_RETRY_MS` | retry delay after a failed scheduled scan |
+| `SCAN_CONFIRMATIONS` | blocks excluded from the scanner head for finality |
+| `SCAN_REORG_OVERLAP` | blocks re-read to replace a reorged cache tail |
+| `RPC_CONCURRENCY`, `RPC_RETRIES` | limits for the pinned public provider |
 
-## Config knobs (.env)
+`GAS_UNITS=700000` is a ceiling, not the amount always charged. The transaction receipt charges actual gas used. The bot nevertheless reserves the full configured ceiling when deciding whether a trade meets the profit threshold, which may reject thin opportunities.
 
-| var | meaning |
+## Validation commands
+
+```powershell
+npm test
+npm run check
+npm run smoke
+npm audit
+```
+
+`npm run check` runs syntax validation, seven automated tests, and deterministic Solidity compilation with `solc 0.8.26`.
+
+## Repository layout
+
+| Path | Purpose |
 |---|---|
-| `LIVE` | `1` = trade, `0` = monitor |
-| `MIN_SIZE_ETH` / `MAX_SIZE_ETH` | trade size bounds |
-| `MIN_PROFIT_BPS` | required net edge after fees + gas |
-| `GAS_UNITS` / `GAS_BUFFER_BPS` | hard transaction gas bound and fee buffer |
-| `GRID_POINTS` | probe sizes per direction |
-| `POLL_MS` / `EVENT_POLL_MS` | fallback poll / Swap-event cadence |
-| `SCAN_INTERVAL_MS` / `SCAN_RETRY_MS` | PM2 scan cadence / failure retry delay |
-| `EXEC_RPC_URL` | private execution RPC (Alchemy) |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | notifications |
+| `arb.js` | market quoting, event handling, serialized live execution |
+| `risk.js` | configuration validation, gas policy, grid sizing, serialization |
+| `scanner.js` | incremental on-chain market discovery and watchlist generation |
+| `scanner-daemon.js` | scheduled scanner process used by PM2 |
+| `scripts/smoke.js` | read-only chain, bytecode, liquidity, and quote checks |
+| `allow-pools.js` | idempotent on-chain PoolKey and token permissions |
+| `executor-admin.js` | pause and unpause operations |
+| `provider.js` | private RPC selection and pinned-provider retry logic |
+| `telegram.js` | non-blocking operational and trade alerts |
+| `contracts/ArbExecutor.sol` | atomic executor and on-chain risk controls |
+| `deploy.js`, `deposit.js`, `withdraw.js` | executor lifecycle and funds |
+| `test/` | contract compile, PoolKey, risk, and scanner-output tests |
 
-## Safety
+## Known limitations
 
-- `.env` (private key + private RPC) is gitignored — never commit it.
-- A successful trade must cover the net target plus bounded gas; reverts still cost gas.
-- Unsafe two-transaction EOA execution is disabled; live mode requires the executor.
-- Pools require an allowlist entry and hook-enabled pools are rejected.
-- Working capital lives in the contract; withdraw anytime (owner only).
-- Existing executor deployments must be replaced because the ABI and safety policy changed.
+- The configured RobinFun manager is the only supported curve venue.
+- The bot does not support hook-enabled pools or non-native V4 pairs.
+- A successful trade must satisfy the configured net floor, but reverted attempts, deployment, permissions, and admin operations still cost gas.
+- There is no persistent P&L database or daily gas-loss circuit breaker yet.
+- The contracts have not received an independent security audit.
+- Competition, transaction ordering, liquidity changes, and RPC latency can eliminate a quoted opportunity before inclusion.
+
+Use a dedicated wallet, start with limited capital, and review on-chain receipts rather than treating uptime or scanner activity as evidence of profit.

@@ -34,6 +34,10 @@ const EXECUTOR_ABI = [
   'function paused() view returns (bool)',
 ];
 
+const CLI_LIVE = process.argv.includes('--live');
+const CLI_DRY_RUN = process.argv.includes('--dry-run');
+if (CLI_LIVE && CLI_DRY_RUN) throw new Error('cannot combine --live and --dry-run');
+
 const CFG = {
   minSize: parseEther(process.env.MIN_SIZE_ETH || '0.002'),
   maxSize: parseEther(process.env.MAX_SIZE_ETH || '0.005'),
@@ -44,7 +48,7 @@ const CFG = {
   gasUnits: BigInt(envInteger('GAS_UNITS', 700000, { min: 100000, max: 5000000 })),
   gasBufferBps: BigInt(envInteger('GAS_BUFFER_BPS', 12000, { min: 10000, max: 30000 })),
   gridPoints: envInteger('GRID_POINTS', 3, { min: 1, max: 32 }),
-  live: process.argv.includes('--live') || process.env.LIVE === '1',
+  live: CLI_LIVE || (!CLI_DRY_RUN && process.env.LIVE === '1'),
   executor: process.env.EXECUTOR_ADDR || null,
   watchlist: process.env.WATCHLIST === '1',
   once: process.argv.includes('--once'),

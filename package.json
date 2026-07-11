@@ -6,8 +6,8 @@
   "engines": { "node": ">=20" },
   "description": "Atomic arbitrage bot: RobinFun bonding curve <-> Uniswap V4 on Robinhood Chain",
   "scripts": {
-    "monitor": "node arb.js",
-    "monitor:once": "node arb.js --once",
+    "monitor": "node arb.js --dry-run",
+    "monitor:once": "node arb.js --dry-run --once",
     "live": "node arb.js --live",
     "test": "node --test",
     "check": "node scripts/check.js && node --test && npm run build:contract",
