@@ -10,12 +10,12 @@ const ABI = [
 ];
 
 async function main() {
-  if (!process.env.PRIVATE_KEY || !process.env.EXECUTOR_ADDR) throw new Error('set PRIVATE_KEY and EXECUTOR_ADDR');
+  if (!process.env.PRIVATE_KEY || !process.env.FLASH_EXECUTOR_ADDR) throw new Error('set PRIVATE_KEY and FLASH_EXECUTOR_ADDR');
   const action = process.argv[2];
   if (!['pause', 'unpause'].includes(action)) throw new Error('usage: node executor-admin.js pause|unpause');
   const provider = await makeProvider();
   const wallet = new Wallet(process.env.PRIVATE_KEY, provider);
-  const exec = new Contract(process.env.EXECUTOR_ADDR, ABI, wallet);
+  const exec = new Contract(process.env.FLASH_EXECUTOR_ADDR, ABI, wallet);
   if ((await exec.owner()).toLowerCase() !== wallet.address.toLowerCase()) throw new Error('wallet is not executor owner');
   const value = action === 'pause';
   if ((await exec.paused()) === value) {
