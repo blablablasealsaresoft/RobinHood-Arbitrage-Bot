@@ -261,11 +261,13 @@ async function buildExecution(anchor, best) {
     legs,
     stateChecks,
   });
-  const signature = await signFlashIntent({
-    privateKey: strategyKey,
-    executor: CFG.executor,
-    intent,
-  });
+  const signature = LIVE
+    ? await signFlashIntent({
+        privateKey: strategyKey,
+        executor: CFG.executor,
+        intent,
+      })
+    : '0x';
   return { intent, legs, stateChecks, signature };
 }
 
