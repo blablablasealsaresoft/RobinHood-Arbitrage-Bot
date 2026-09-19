@@ -72,3 +72,10 @@ export const POOL_ID = POOLS[0].id;
 
 // Native ETH pseudo-address used by the curve/V4 for the ETH side.
 export const NATIVE = '0x0000000000000000000000000000000000000000';
+
+// Canonical wrapped native token on Robinhood Chain mainnet.
+export const WETH = {
+  address: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',
+  symbol: 'WETH',
+  decimals: 18,
+};
