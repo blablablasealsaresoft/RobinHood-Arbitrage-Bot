@@ -160,7 +160,10 @@ async function main() {
   ].map((x) => x.toLowerCase()));
   const curve = new Contract(CURVE.address, CURVE_ABI, runner);
   const quoter = new Contract(V4.quoter, QUOTER_ABI, provider);
-  const executor = CFG.executor && execWallet ? new Contract(CFG.executor, EXECUTOR_ABI, execWallet) : null;
+  const executor = !CFG.flashMode && CFG.executor && execWallet ? new Contract(CFG.executor, EXECUTOR_ABI, execWallet) : null;
+  const flashExecutor = CFG.flashMode && CFG.flashExecutor && execWallet
+    ? new Contract(CFG.flashExecutor, FLASH_EXECUTOR_ABI, execWallet)
+    : null;
 
   if (executor) {
     const [rawChainId, code, owner, contractMax, isPaused] = await Promise.all([
@@ -185,7 +188,7 @@ async function main() {
   let gasPolicy = feeOverrides(await execProvider.getFeeData(), CFG.gasUnits, CFG.gasBufferBps);
   const latency = createLatencyRecorder();
 
-  console.log(`\nRobinFun<->UniV4 arb | ${CFG.live ? 'LIVE' : 'DRY-RUN'} | ${executor ? 'ATOMIC' : 'MONITOR'} | ${CFG.watchlist ? 'WATCHLIST' : 'single'}`);
+  console.log(`\nRobinFun<->UniV4 arb | ${CFG.live ? 'LIVE' : 'DRY-RUN'} | ${CFG.flashMode ? 'SEQUENCER-FLASH' : (executor ? 'ATOMIC' : 'MONITOR')} | ${CFG.watchlist ? 'WATCHLIST' : 'single'}`);
   console.log(`wallet: ${wallet ? wallet.address : '(monitor only)'}`);
   console.log(`markets: ${markets.map(m => `${m.symbol}(${m.pools.map(p => p.name).join('/')})`).join(', ')}`);
   console.log(`gate >= ${CFG.minProfitBps} bps | size [${formatEther(CFG.minSize)}, ${formatEther(CFG.maxSize)}] ETH\n`);
@@ -241,6 +244,115 @@ async function main() {
     const rc = await tx.wait();
     console.log('  tx', rc.hash);
     notifyAtomic({ symbol: b.market.symbol, dir: b.dir, buyVenue: b.dir === 'A' ? 'curve' : `V4 ${b.pool.name}`, sellVenue: b.dir === 'A' ? `V4 ${b.pool.name}` : 'curve', sizeEth: b.size, receipt: rc, netEth: 0n }).catch(() => {});
+  }
+
+  let flashNonce = BigInt(Date.now()) << 32n;
+
+  function v4AdapterData(key) {
+    return ABI_CODER.encode(
+      ['tuple(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks)'],
+      [keyTuple(key)],
+    );
+  }
+
+  async function stateLocksFor(b) {
+    const token = b.market.token;
+    const curveCall = CURVE_STATE.encodeFunctionData('curves', [token]);
+    const slot0Call = V4_STATE.encodeFunctionData('getSlot0', [b.pool.id]);
+    const liquidityCall = V4_STATE.encodeFunctionData('getLiquidity', [b.pool.id]);
+    const [curveReturn, slot0Return, liquidityReturn] = await Promise.all([
+      provider.call({ to: CURVE.address, data: curveCall }),
+      provider.call({ to: V4.stateView, data: slot0Call }),
+      provider.call({ to: V4.stateView, data: liquidityCall }),
+    ]);
+    return [
+      genericStateCheck(CURVE.address, curveCall, curveReturn),
+      genericStateCheck(V4.stateView, slot0Call, slot0Return),
+      genericStateCheck(V4.stateView, liquidityCall, liquidityReturn),
+    ];
+  }
+
+  async function executeFlash(b, sequencerContext) {
+    if (!flashExecutor) throw new Error('sequencer flash executor unavailable');
+    if (!process.env.STRATEGY_PRIVATE_KEY) throw new Error('STRATEGY_PRIVATE_KEY missing');
+    if (!sequencerContext?.triggerTxHash || !sequencerContext?.sequenceNumber) {
+      throw new Error('missing sequencer trigger context');
+    }
+
+    const targetBlock = BigInt(sequencerContext.sequenceNumber);
+    const head = BigInt(await provider.getBlockNumber());
+    if (head < targetBlock) throw new Error(`fast RPC behind sequencer target: head=${head} target=${targetBlock}`);
+    if (head - targetBlock > BigInt(CFG.sequencerMaxBlockLag)) {
+      throw new Error(`sequencer opportunity stale by ${head - targetBlock} blocks`);
+    }
+
+    const minProfit = (b.size * CFG.minProfitBps) / 10000n + b.gasCost;
+    const finalMin = b.size + minProfit;
+    const minTok = bpsDown(b.tok, CFG.slippageBps);
+    const poolData = v4AdapterData(b.pool.key);
+    const legs = b.dir === 'A'
+      ? [
+          { adapter: CFG.curveAdapter, tokenIn: WETH, tokenOut: b.market.token, minOut: minTok, data: '0x' },
+          { adapter: CFG.v4Adapter, tokenIn: b.market.token, tokenOut: WETH, minOut: finalMin, data: poolData },
+        ]
+      : [
+          { adapter: CFG.v4Adapter, tokenIn: WETH, tokenOut: b.market.token, minOut: minTok, data: poolData },
+          { adapter: CFG.curveAdapter, tokenIn: b.market.token, tokenOut: WETH, minOut: finalMin, data: '0x' },
+        ];
+
+    const checks = await stateLocksFor(b);
+    const maxGasPrice = b.txOverrides.maxFeePerGas ?? b.txOverrides.gasPrice;
+    if (!maxGasPrice) throw new Error('missing bounded gas price');
+
+    const nonce = flashNonce++;
+    const intent = buildFlashIntent({
+      settlementToken: WETH,
+      borrowAmount: b.size,
+      minProfit,
+      maxGasPrice,
+      validAfterBlock: head,
+      validUntilBlock: head + BigInt(CFG.flashBlockWindow),
+      deadline: BigInt(Math.floor(Date.now() / 1000) + CFG.flashDeadlineSeconds),
+      nonce,
+      triggerTxHash: sequencerContext.triggerTxHash,
+      legs,
+      stateChecks: checks,
+    });
+    const signature = await signFlashIntent({
+      privateKey: process.env.STRATEGY_PRIVATE_KEY,
+      executor: CFG.flashExecutor,
+      intent,
+    });
+
+    const submitAt = Date.now();
+    const tx = await flashExecutor.executeFlashArb(intent, legs, checks, signature, b.txOverrides);
+    latency.record('flash-submitted', {
+      triggerTxHash: sequencerContext.triggerTxHash,
+      targetBlock: targetBlock.toString(),
+      stateBlock: head.toString(),
+      symbol: b.market.symbol,
+      direction: b.dir,
+      txHash: tx.hash,
+      feedToSubmitMs: sequencerContext.receivedAt ? submitAt - sequencerContext.receivedAt : null,
+      borrowWei: b.size.toString(),
+      minProfitWei: minProfit.toString(),
+    });
+    const receipt = await tx.wait();
+    latency.record('flash-confirmed', {
+      txHash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+      submitToConfirmMs: Date.now() - submitAt,
+    });
+    console.log('  flash tx', receipt.hash);
+    notifyAtomic({
+      symbol: b.market.symbol,
+      dir: b.dir,
+      buyVenue: b.dir === 'A' ? 'curve' : `V4 ${b.pool.name}`,
+      sellVenue: b.dir === 'A' ? `V4 ${b.pool.name}` : 'curve',
+      sizeEth: b.size,
+      receipt,
+      netEth: 0n,
+    }).catch(() => {});
   }
 
   let lastLog = 0;
