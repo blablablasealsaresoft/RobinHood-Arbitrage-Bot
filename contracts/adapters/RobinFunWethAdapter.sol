@@ -25,12 +25,14 @@ contract RobinFunWethAdapter {
     IRobinFunCurve public immutable curve;
     IWETHCurveAdapter public immutable weth;
     mapping(address => bool) public allowedTokens;
+    uint256 private unlocked = 1;
 
     event TokenAllowed(address indexed token, bool allowed);
     event OwnershipTransferStarted(address indexed owner, address indexed pendingOwner);
     event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
 
     modifier onlyOwner() { require(msg.sender == owner, "not owner"); _; }
+    modifier nonReentrant() { require(unlocked == 1, "reentrant"); unlocked = 2; _; unlocked = 1; }
 
     constructor(address initialOwner, address curveAddress, address wethAddress) {
         require(initialOwner != address(0), "zero owner");
@@ -58,7 +60,7 @@ contract RobinFunWethAdapter {
         uint256 amountIn,
         uint256 minOut,
         bytes calldata data
-    ) external returns (uint256 amountOut) {
+    ) external nonReentrant returns (uint256 amountOut) {
         require(data.length == 0, "unexpected data");
         require(amountIn > 0 && minOut > 0, "zero amount");
 
