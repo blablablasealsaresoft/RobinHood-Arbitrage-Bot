@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import {
   AbiCoder,
   Wallet,
@@ -21,6 +22,8 @@ export const FLASH_INTENT_TYPES = {
     { name: 'borrowAmount', type: 'uint256' },
     { name: 'minProfit', type: 'uint256' },
     { name: 'maxGasPrice', type: 'uint256' },
+    { name: 'anchorBlock', type: 'uint64' },
+    { name: 'anchorBlockHash', type: 'bytes32' },
     { name: 'validAfterBlock', type: 'uint64' },
     { name: 'validUntilBlock', type: 'uint64' },
     { name: 'deadline', type: 'uint64' },
@@ -81,11 +84,17 @@ export function v2ReserveStateCheck(pair, reserve0, reserve1) {
   };
 }
 
+export function randomNonce192() {
+  return BigInt('0x' + crypto.randomBytes(24).toString('hex'));
+}
+
 export function buildFlashIntent({
   settlementToken,
   borrowAmount,
   minProfit,
   maxGasPrice,
+  anchorBlock,
+  anchorBlockHash,
   validAfterBlock,
   validUntilBlock,
   deadline,
@@ -99,6 +108,8 @@ export function buildFlashIntent({
     borrowAmount: BigInt(borrowAmount),
     minProfit: BigInt(minProfit),
     maxGasPrice: BigInt(maxGasPrice),
+    anchorBlock: BigInt(anchorBlock),
+    anchorBlockHash,
     validAfterBlock: BigInt(validAfterBlock),
     validUntilBlock: BigInt(validUntilBlock),
     deadline: BigInt(deadline),
@@ -109,6 +120,15 @@ export function buildFlashIntent({
   };
 }
 
+export function intentDomain(executor, chainId = 4663) {
+  return {
+    name: 'SequencerFlashArbExecutorV4',
+    version: '1',
+    chainId,
+    verifyingContract: getAddress(executor),
+  };
+}
+
 export async function signFlashIntent({
   privateKey,
   executor,
@@ -116,11 +136,5 @@ export async function signFlashIntent({
   intent,
 }) {
   const wallet = new Wallet(privateKey);
-  const domain = {
-    name: 'SequencerFlashArbExecutorV3',
-    version: '1',
-    chainId,
-    verifyingContract: getAddress(executor),
-  };
-  return wallet.signTypedData(domain, FLASH_INTENT_TYPES, intent);
+  return wallet.signTypedData(intentDomain(executor, chainId), FLASH_INTENT_TYPES, intent);
 }
