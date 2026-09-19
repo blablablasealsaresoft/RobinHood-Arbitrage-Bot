@@ -8,9 +8,9 @@
   },
   "description": "Atomic arbitrage bot: RobinFun bonding curve <-> Uniswap V4 on Robinhood Chain",
   "scripts": {
-    "monitor": "node arb.js --dry-run",
-    "monitor:once": "node arb.js --dry-run --once",
-    "live": "node arb.js --live",
+    "monitor": "node sequencer-bot.js",
+    "monitor:once": "node sequencer-bot.js --once",
+    "live": "node sequencer-bot.js --live",
     "test": "node --test",
     "check": "node scripts/check.js && node --test && npm run build:contract",
     "smoke": "node scripts/smoke.js",
@@ -20,13 +20,16 @@
     "snapshot": "node snapshot.js",
     "discover": "node discover.mjs",
     "build:contract": "node scripts/compile.js",
-    "deploy": "node deploy.js",
+    "deploy": "node deploy-sequencer.js",
     "deposit": "node deposit.js",
     "withdraw": "node withdraw.js",
     "allow-pools": "node allow-pools.js",
     "pause": "node executor-admin.js pause",
     "unpause": "node executor-admin.js unpause",
-    "feed:edge": "python3.11 sequencer/rh_feed_edge.py"
+    "feed:edge": "python3.11 sequencer/rh_feed_edge.py",
+    "legacy:monitor": "node arb.js --dry-run",
+    "legacy:live": "node arb.js --live",
+    "deploy:legacy": "node deploy.js"
   },
   "dependencies": {
     "dotenv": "17.4.2",
