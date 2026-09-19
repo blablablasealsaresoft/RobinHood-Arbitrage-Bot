@@ -88,9 +88,11 @@ export async function waitForExactL2Block(provider, targetBlock, targetHash, {
 } = {}) {
   const deadline = performance.now() + timeoutMs;
   for (;;) {
-    const head = await provider.getBlockNumber();
+    const headHex = await provider.send('eth_blockNumber', []);
+    const head = Number(BigInt(headHex));
     if (head >= targetBlock) {
-      const block = await provider.getBlock(targetBlock);
+      const targetHex = '0x' + BigInt(targetBlock).toString(16);
+      const block = await provider.send('eth_getBlockByNumber', [targetHex, false]);
       if (!block) throw new Error('local node missing anchor block');
       if (String(block.hash).toLowerCase() !== String(targetHash).toLowerCase()) {
         throw new Error(`local node branch mismatch at ${targetBlock}`);
