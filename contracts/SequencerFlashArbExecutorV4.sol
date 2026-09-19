@@ -1,14 +1,135 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
-import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
-import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+interface IERC20V4 {
+    function balanceOf(address) external view returns (uint256);
+    function transfer(address,uint256) external returns (bool);
+    function approve(address,uint256) external returns (bool);
+}
+
+interface IERC1271V4 {
+    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4);
+}
+
+abstract contract SequencerAuthV4 {
+    bytes4 private constant ERC1271_MAGIC = 0x1626ba7e;
+    uint256 private constant SECP256K1N_DIV_2 =
+        0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0;
+
+    address public owner;
+    address public pendingOwner;
+    bool public paused;
+    uint256 private _entered;
+
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor(address initialOwner) {
+        require(initialOwner != address(0), "zero owner");
+        owner = initialOwner;
+        emit OwnershipTransferred(address(0), initialOwner);
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "not owner");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!paused, "paused");
+        _;
+    }
+
+    modifier whenPaused() {
+        require(paused, "not paused");
+        _;
+    }
+
+    modifier nonReentrant() {
+        require(_entered == 0, "reentrant");
+        _entered = 1;
+        _;
+        _entered = 0;
+    }
+
+    function transferOwnership(address next) external onlyOwner {
+        require(next != address(0), "zero owner");
+        pendingOwner = next;
+        emit OwnershipTransferStarted(owner, next);
+    }
+
+    function acceptOwnership() external {
+        require(msg.sender == pendingOwner, "not pending owner");
+        address old = owner;
+        owner = msg.sender;
+        pendingOwner = address(0);
+        emit OwnershipTransferred(old, msg.sender);
+    }
+
+    function _setPaused(bool value) internal {
+        paused = value;
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory ret) = token.call(abi.encodeCall(IERC20V4.transfer, (to, amount)));
+        require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "transfer failed");
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        if (!_tryApprove(token, spender, amount)) {
+            require(_tryApprove(token, spender, 0), "approve reset failed");
+            require(_tryApprove(token, spender, amount), "approve failed");
+        }
+    }
+
+    function _tryApprove(address token, address spender, uint256 amount) private returns (bool) {
+        (bool ok, bytes memory ret) = token.call(abi.encodeCall(IERC20V4.approve, (spender, amount)));
+        return ok && (ret.length == 0 || (ret.length >= 32 && abi.decode(ret, (bool))));
+    }
+
+    function _isValidSigner(address signer, bytes32 digest, bytes calldata sig) internal view returns (bool) {
+        if (signer.code.length != 0) {
+            (bool ok, bytes memory ret) = signer.staticcall(
+                abi.encodeCall(IERC1271V4.isValidSignature, (digest, sig))
+            );
+            return ok && ret.length >= 32 && bytes4(ret) == ERC1271_MAGIC;
+        }
+        if (sig.length != 65) return false;
+        bytes32 r;
+        bytes32 ss;
+        uint8 v;
+        assembly {
+            r := calldataload(sig.offset)
+            ss := calldataload(add(sig.offset, 32))
+            v := byte(0, calldataload(add(sig.offset, 64)))
+        }
+        if (uint256(ss) > SECP256K1N_DIV_2) return false;
+        if (v != 27 && v != 28) return false;
+        return ecrecover(digest, v, r, ss) == signer;
+    }
+}
+
+abstract contract EIP712LiteV4 {
+    bytes32 private constant DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    bytes32 private immutable _nameHash;
+    bytes32 private immutable _versionHash;
+
+    constructor(string memory name_, string memory version_) {
+        _nameHash = keccak256(bytes(name_));
+        _versionHash = keccak256(bytes(version_));
+    }
+
+    function _domainSeparatorV4() internal view returns (bytes32) {
+        return keccak256(abi.encode(
+            DOMAIN_TYPEHASH, _nameHash, _versionHash, block.chainid, address(this)
+        ));
+    }
+
+    function _hashTypedDataV4(bytes32 structHash) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19\x01", _domainSeparatorV4(), structHash));
+    }
+}
 
 interface IMorphoFlashLoanV4 {
     function flashLoan(address token, uint256 assets, bytes calldata data) external;
@@ -154,7 +275,7 @@ contract SequencerFlashArbExecutorV4 is EIP712, Ownable2Step, Pausable, Reentran
         address treasury_,
         address morpho_,
         uint64 maxAnchorDelay_
-    ) Ownable(initialOwner) EIP712("RobinhoodSequencerFlashArb", "4") {
+    ) SequencerAuthV4(initialOwner) EIP712LiteV4("RobinhoodSequencerFlashArb", "4") {
         if (block.chainid != ROBINHOOD_CHAIN_ID) revert WrongChain(block.chainid, ROBINHOOD_CHAIN_ID);
         if (
             initialOwner == address(0) ||
@@ -230,7 +351,7 @@ contract SequencerFlashArbExecutorV4 is EIP712, Ownable2Step, Pausable, Reentran
 
     function rescueToken(address token, address to, uint256 amount) external onlyOwner whenPaused {
         if (to == address(0)) revert ZeroAddress();
-        IERC20(token).safeTransfer(to, amount);
+        _safeTransfer(token, to, amount);
     }
 
     function domainSeparator() external view returns (bytes32) {
@@ -265,12 +386,12 @@ contract SequencerFlashArbExecutorV4 is EIP712, Ownable2Step, Pausable, Reentran
         _validateRouteAndHashes(intent, legs, checks);
 
         bytes32 digest = _intentDigest(intent);
-        if (!SignatureChecker.isValidSignatureNow(strategySigner, digest, signature)) revert UnauthorizedSigner();
+        if (!_isValidSigner(strategySigner, digest, signature)) revert UnauthorizedSigner();
         _useNonce(intent.nonce);
 
         _runStateChecks(checks);
 
-        IERC20 settlement = IERC20(intent.settlementToken);
+        IERC20V4 settlement = IERC20V4(intent.settlementToken);
         uint256 beforeBalance = settlement.balanceOf(address(this));
 
         CallbackPayload memory payload = CallbackPayload({
@@ -293,7 +414,7 @@ contract SequencerFlashArbExecutorV4 is EIP712, Ownable2Step, Pausable, Reentran
         _activeIntentDigest = bytes32(0);
         _activePayloadHash = bytes32(0);
 
-        settlement.forceApprove(address(morpho), 0);
+        _forceApprove(intent.settlementToken, address(morpho), 0);
 
         uint256 afterBalance = settlement.balanceOf(address(this));
         if (afterBalance < beforeBalance) revert BalanceInvariant();
@@ -301,7 +422,7 @@ contract SequencerFlashArbExecutorV4 is EIP712, Ownable2Step, Pausable, Reentran
         profit = afterBalance - beforeBalance;
         if (profit < intent.minProfit) revert InsufficientProfit(profit, intent.minProfit);
 
-        if (profit != 0) settlement.safeTransfer(treasury, profit);
+        if (profit != 0) _safeTransfer(intent.settlementToken, treasury, profit);
 
         emit FlashArbExecuted(
             digest,
@@ -323,7 +444,7 @@ contract SequencerFlashArbExecutorV4 is EIP712, Ownable2Step, Pausable, Reentran
         if (payload.intentDigest != _activeIntentDigest) revert CallbackMismatch();
         if (assets != payload.borrowAmount) revert CallbackMismatch();
 
-        IERC20 settlement = IERC20(payload.settlementToken);
+        IERC20V4 settlement = IERC20V4(payload.settlementToken);
         uint256 withLoan = settlement.balanceOf(address(this));
         if (withLoan < assets) revert BalanceInvariant();
         uint256 baseline = withLoan - assets;
@@ -333,10 +454,10 @@ contract SequencerFlashArbExecutorV4 is EIP712, Ownable2Step, Pausable, Reentran
 
         for (uint256 i; i < n; ++i) {
             Leg memory leg = payload.legs[i];
-            IERC20 outToken = IERC20(leg.tokenOut);
+            IERC20V4 outToken = IERC20V4(leg.tokenOut);
             uint256 beforeOut = outToken.balanceOf(address(this));
 
-            IERC20(leg.tokenIn).safeTransfer(leg.adapter, amount);
+            _safeTransfer(leg.tokenIn, leg.adapter, amount);
             ISequencerSwapAdapterV4(leg.adapter).swapExactInput(
                 leg.tokenIn,
                 leg.tokenOut,
@@ -361,7 +482,7 @@ contract SequencerFlashArbExecutorV4 is EIP712, Ownable2Step, Pausable, Reentran
             revert InsufficientProfit(realizedProfit, payload.minProfit);
         }
 
-        settlement.forceApprove(address(morpho), assets);
+        _forceApprove(payload.settlementToken, address(morpho), assets);
     }
 
     function _validateIntent(FlashArbIntent calldata intent) internal view {
