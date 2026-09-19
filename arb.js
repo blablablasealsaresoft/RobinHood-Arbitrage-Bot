@@ -18,7 +18,7 @@
 
 import 'dotenv/config';
 import fs from 'node:fs';
-import { Contract, Wallet, JsonRpcProvider, Network, parseEther, formatEther, id as topicId, getAddress, AbiCoder, keccak256 } from 'ethers';
+import { Contract, Wallet, JsonRpcProvider, Network, Interface, parseEther, formatEther, id as topicId, getAddress, AbiCoder, keccak256 } from 'ethers';
 import { makeProvider } from './provider.js';
 import { CURVE_ABI, QUOTER_ABI } from './abis.js';
 import { CURVE, V4, TOKEN, POOLS } from './config.js';
@@ -26,6 +26,7 @@ import { notifyStartup, notifyAtomic, notifyError, notifyPoll, notifyNoMarkets, 
 import { bpsDown, buildGrid, envInteger, feeOverrides, serialRunner } from './risk.js';
 import { SequencerFeedClient } from './sequencer-feed.js';
 import { createLatencyRecorder } from './latency.js';
+import { buildFlashIntent, genericStateCheck, signFlashIntent } from './flash-intent.js';
 
 const EXECUTOR_ABI = [
   'function curveToV4(address token,uint256 ethIn,uint256 minTokensOut,(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks) key,uint128 minEthOut,uint256 minProfit)',
@@ -35,6 +36,16 @@ const EXECUTOR_ABI = [
   'function allowedPools(bytes32) view returns (bool)',
   'function paused() view returns (bool)',
 ];
+
+const FLASH_EXECUTOR_ABI = [
+  'function executeFlashArb((address settlementToken,uint256 borrowAmount,uint256 minProfit,uint256 maxGasPrice,uint64 validAfterBlock,uint64 validUntilBlock,uint64 deadline,uint256 nonce,bytes32 triggerTxHash,bytes32 routeHash,bytes32 stateChecksHash) intent,(address adapter,address tokenIn,address tokenOut,uint256 minOut,bytes data)[] legs,(uint8 mode,address target,bytes callData,bytes32 expectedReturnHash)[] checks,bytes signature)',
+];
+const WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';
+const CURVE_STATE = new Interface(CURVE_ABI);
+const V4_STATE = new Interface([
+  'function getSlot0(bytes32 poolId) view returns (uint160 sqrtPriceX96,int24 tick,uint24 protocolFee,uint24 lpFee)',
+  'function getLiquidity(bytes32 poolId) view returns (uint128 liquidity)',
+]);
 
 const CLI_LIVE = process.argv.includes('--live');
 const CLI_DRY_RUN = process.argv.includes('--dry-run');
@@ -58,9 +69,21 @@ const CFG = {
   sequencerTriggerMinMs: envInteger('SEQUENCER_TRIGGER_MIN_MS', 500, { min: 0, max: 60000 }),
   sequencerLiveMaxAgeMs: envInteger('SEQUENCER_LIVE_MAX_AGE_MS', 5000, { min: 100, max: 60000 }),
   sequencerFilterMode: process.env.SEQUENCER_FILTER_MODE || 'targets',
+  flashMode: process.env.SEQUENCER_FLASH_MODE === '1',
+  flashExecutor: process.env.SEQUENCER_EXECUTOR_ADDR || null,
+  curveAdapter: process.env.ROBIN_FUN_WETH_ADAPTER || null,
+  v4Adapter: process.env.UNISWAP_V4_WETH_ADAPTER || null,
+  flashGasUnits: BigInt(envInteger('FLASH_GAS_UNITS', 1500000, { min: 300000, max: 5000000 })),
+  flashBlockWindow: envInteger('FLASH_BLOCK_WINDOW', 1, { min: 1, max: 16 }),
+  flashDeadlineSeconds: envInteger('FLASH_DEADLINE_SECONDS', 5, { min: 1, max: 60 }),
+  sequencerMaxBlockLag: envInteger('SEQUENCER_MAX_BLOCK_LAG', 8, { min: 0, max: 1000 }),
 };
 if (CFG.minSize <= 0n || CFG.maxSize < CFG.minSize) throw new Error('invalid MIN_SIZE_ETH/MAX_SIZE_ETH');
 if (!['targets','all'].includes(CFG.sequencerFilterMode)) throw new Error('SEQUENCER_FILTER_MODE must be targets or all');
+if (CFG.flashMode && !CFG.sequencerFeed) throw new Error('SEQUENCER_FLASH_MODE requires SEQUENCER_FEED=1');
+if (CFG.flashMode && (!CFG.flashExecutor || !CFG.curveAdapter || !CFG.v4Adapter)) {
+  throw new Error('SEQUENCER_FLASH_MODE requires SEQUENCER_EXECUTOR_ADDR, ROBIN_FUN_WETH_ADAPTER and UNISWAP_V4_WETH_ADAPTER');
+}
 const keyTuple = (k) => [k.currency0, k.currency1, k.fee, k.tickSpacing, k.hooks];
 const ABI_CODER = AbiCoder.defaultAbiCoder();
 const ZERO = '0x0000000000000000000000000000000000000000';
@@ -114,7 +137,8 @@ async function main() {
   console.log(`monitor RPC: ${monitorRpcUrl ? (process.env.FAST_RPC_URL ? 'fast/local' : (process.env.RPC_URL ? 'dedicated/private' : 'shared execution RPC')) : 'pinned public'}`);
   const wallet = process.env.PRIVATE_KEY ? new Wallet(process.env.PRIVATE_KEY, provider) : null;
   if (CFG.live && !wallet) throw new Error('LIVE requires PRIVATE_KEY');
-  if (CFG.live && !CFG.executor) throw new Error('LIVE requires EXECUTOR_ADDR; unsafe EOA mode is disabled');
+  if (CFG.live && !CFG.executor && !CFG.flashMode) throw new Error('LIVE requires EXECUTOR_ADDR or SEQUENCER_FLASH_MODE; unsafe EOA mode is disabled');
+  if (CFG.live && CFG.flashMode && !process.env.STRATEGY_PRIVATE_KEY) throw new Error('live sequencer flash mode requires STRATEGY_PRIVATE_KEY');
   const runner = provider;
 
   // Dedicated EXECUTION provider (e.g. Alchemy) — reliable for trade txs, keeps the
