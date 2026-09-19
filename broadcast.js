@@ -9,6 +9,7 @@ function urlsFromEnv() {
 }
 
 async function sendRaw(url, rawTx, timeoutMs) {
+  const started = process.hrtime.bigint();
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), timeoutMs);
   try {
@@ -20,9 +21,9 @@ async function sendRaw(url, rawTx, timeoutMs) {
     });
     const j = await r.json();
     if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
-    return { url, ok: true, result: j.result };
+    return { url, ok: true, result: j.result, latencyUs: Number((process.hrtime.bigint() - started) / 1000n) };
   } catch (e) {
-    return { url, ok: false, error: e?.message || String(e) };
+    return { url, ok: false, error: e?.message || String(e), latencyUs: Number((process.hrtime.bigint() - started) / 1000n) };
   } finally {
     clearTimeout(t);
   }
@@ -31,8 +32,9 @@ async function sendRaw(url, rawTx, timeoutMs) {
 export async function signAndBroadcast(wallet, txRequest, {
   urls = urlsFromEnv(),
   timeoutMs = Number(process.env.BROADCAST_TIMEOUT_MS || 1200),
+  populate = true,
 } = {}) {
-  const populated = await wallet.populateTransaction(txRequest);
+  const populated = populate ? await wallet.populateTransaction(txRequest) : txRequest;
   const rawTx = await wallet.signTransaction(populated);
   const txHash = keccak256(rawTx);
 
