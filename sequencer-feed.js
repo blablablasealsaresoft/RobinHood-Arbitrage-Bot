@@ -180,7 +180,7 @@ export class SequencerFeedClient {
     const latestTimestamp = timestamps.length ? Math.max(...timestamps) : 0;
     const messageAgeMs = latestTimestamp ? receivedAt - latestTimestamp * 1000 : null;
     const live = messageAgeMs !== null && messageAgeMs <= this.maxLiveAgeMs;
-    const transactions = this.decodeTransactions ? decodeFeedTransactions(parsed) : [];
+    const transactions = this.decodeTransactions && live ? decodeFeedTransactions(parsed) : [];
 
     this.stats.frames++;
     this.stats.messages += messages.length;
