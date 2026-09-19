@@ -131,6 +131,11 @@ abstract contract EIP712LiteV4 {
     }
 }
 
+interface IArbSysSequencerV4 {
+    function arbBlockNumber() external view returns (uint256);
+    function arbBlockHash(uint256 arbBlockNum) external view returns (bytes32);
+}
+
 interface IMorphoFlashLoanV4 {
     function flashLoan(address token, uint256 assets, bytes calldata data) external;
 }
@@ -155,6 +160,7 @@ contract SequencerFlashArbExecutorV4 is EIP712, Ownable2Step, Pausable, Reentran
     using SafeERC20 for IERC20;
 
     uint256 public constant ROBINHOOD_CHAIN_ID = 4663;
+    IArbSysSequencerV4 private constant ARBSYS = IArbSysSequencerV4(address(0x64));
     uint256 public constant MAX_LEGS = 6;
     uint256 public constant MAX_STATE_CHECKS = 8;
     uint256 public constant MAX_LEG_DATA_BYTES = 16_384;
@@ -431,7 +437,7 @@ contract SequencerFlashArbExecutorV4 is EIP712, Ownable2Step, Pausable, Reentran
             intent.settlementToken,
             intent.borrowAmount,
             profit,
-            block.number
+            ARBSYS.arbBlockNumber()
         );
     }
 
@@ -497,8 +503,9 @@ contract SequencerFlashArbExecutorV4 is EIP712, Ownable2Step, Pausable, Reentran
             revert BorrowCapExceeded(intent.settlementToken, intent.borrowAmount, cap);
         }
 
-        if (block.number <= intent.anchorBlock) {
-            revert AnchorNotReached(block.number, intent.anchorBlock);
+        uint256 l2Block = ARBSYS.arbBlockNumber();
+        if (l2Block <= intent.anchorBlock) {
+            revert AnchorNotReached(l2Block, intent.anchorBlock);
         }
 
         if (
@@ -506,11 +513,11 @@ contract SequencerFlashArbExecutorV4 is EIP712, Ownable2Step, Pausable, Reentran
             intent.validUntilBlock - intent.anchorBlock > maxAnchorDelay
         ) revert InvalidAnchorWindow();
 
-        if (block.number > intent.validUntilBlock) {
-            revert AnchorExpired(block.number, intent.validUntilBlock);
+        if (l2Block > intent.validUntilBlock) {
+            revert AnchorExpired(l2Block, intent.validUntilBlock);
         }
 
-        bytes32 actualAnchorHash = blockhash(intent.anchorBlock);
+        bytes32 actualAnchorHash = ARBSYS.arbBlockHash(intent.anchorBlock);
         if (actualAnchorHash != intent.anchorBlockHash) {
             revert AnchorHashMismatch(actualAnchorHash, intent.anchorBlockHash);
         }
