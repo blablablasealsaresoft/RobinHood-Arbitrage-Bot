@@ -6,6 +6,7 @@
 // parsing independent from Nitro's internal L2-message encoding while still
 // allowing the arb engine to react immediately to newly sequenced work.
 
+import WebSocket from 'ws';
 import { decodeFeedTransactions } from './sequencer-codec.js';
 
 const DEFAULT_URL = 'wss://feed.mainnet.chain.robinhood.com';
@@ -15,7 +16,7 @@ export class SequencerFeedClient {
     url = process.env.SEQUENCER_FEED_URL || DEFAULT_URL,
     onBatch = () => {},
     onStatus = () => {},
-    WebSocketImpl = globalThis.WebSocket,
+    WebSocketImpl = WebSocket,
     reconnectMinMs = 500,
     reconnectMaxMs = 15000,
     idleTimeoutMs = 30000,
@@ -83,7 +84,15 @@ export class SequencerFeedClient {
     if (this.stopped) return;
     let ws;
     try {
-      ws = new this.WebSocketImpl(this.url);
+      const headers = { 'Arbitrum-Feed-Client-Version': '2' };
+      if (this.stats.lastSequenceNumber !== null) {
+        headers['Arbitrum-Requested-Sequence-Number'] = String(this.stats.lastSequenceNumber);
+      }
+      ws = new this.WebSocketImpl(this.url, {
+        perMessageDeflate: true,
+        headers,
+        maxPayload: 16 * 1024 * 1024,
+      });
     } catch (error) {
       this.#fail(error);
       this.#scheduleReconnect();
