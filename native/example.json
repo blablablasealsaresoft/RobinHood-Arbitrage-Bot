@@ -1,0 +1,61 @@
+{
+  "description": "SYNTHETIC OFFLINE FIXTURE. Addresses and balances are NOT deployments. Never use live.",
+  "reviewed": false,
+  "maxStateAgeMs": 250,
+  "pools": [
+    {
+      "id": "demo-a",
+      "kind": "v2",
+      "pair": "0x000000000000000000000000000000000000000a",
+      "token0": "0x0000000000000000000000000000000000000001",
+      "token1": "0x0000000000000000000000000000000000000002",
+      "adapter": "0x0000000000000000000000000000000000000014",
+      "feeNumerator": "997",
+      "feeDenominator": "1000"
+    },
+    {
+      "id": "demo-b",
+      "kind": "v2",
+      "pair": "0x000000000000000000000000000000000000000b",
+      "token0": "0x0000000000000000000000000000000000000001",
+      "token1": "0x0000000000000000000000000000000000000002",
+      "adapter": "0x0000000000000000000000000000000000000015",
+      "feeNumerator": "997",
+      "feeDenominator": "1000"
+    }
+  ],
+  "routes": [
+    {
+      "id": "demo-loop",
+      "settlementToken": "0x0000000000000000000000000000000000000001",
+      "minInput": "1",
+      "maxInput": "100000",
+      "borrowCap": "100000",
+      "slippageBps": "0",
+      "minProfit": "0",
+      "legs": [
+        {
+          "poolId": "demo-a",
+          "tokenIn": "0x0000000000000000000000000000000000000001",
+          "tokenOut": "0x0000000000000000000000000000000000000002"
+        },
+        {
+          "poolId": "demo-b",
+          "tokenIn": "0x0000000000000000000000000000000000000002",
+          "tokenOut": "0x0000000000000000000000000000000000000001"
+        }
+      ]
+    }
+  ],
+  "costs": [
+    {
+      "settlementToken": "0x0000000000000000000000000000000000000001",
+      "settlementUnitsPerWeiNumerator": "1",
+      "settlementUnitsPerWeiDenominator": "1",
+      "successGasWei": "100",
+      "revertGasWei": "50",
+      "loseRaceBps": "2000",
+      "validUntilBlock": "103"
+    }
+  ]
+}
