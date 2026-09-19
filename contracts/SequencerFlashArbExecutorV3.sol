@@ -209,7 +209,7 @@ contract SequencerFlashArbExecutorV3 {
                 intent.stateChecksHash
             )
         );
-        return keccak256(abi.encodePacked("\x19\x01", domainSeparator(), structHash));
+        return keccak256(abi.encodePacked(hex"1901", domainSeparator(), structHash));
     }
 
     function executeFlashArb(
