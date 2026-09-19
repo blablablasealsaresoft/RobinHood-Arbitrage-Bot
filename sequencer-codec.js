@@ -68,6 +68,7 @@ export function decodeTransaction(raw) {
 
   if (!layout) {
     return {
+      raw,
       txType,
       to: null,
       selector: null,
@@ -83,6 +84,7 @@ export function decodeTransaction(raw) {
   try { fields = scanRlpList(body); }
   catch {
     return {
+      raw,
       txType,
       to: null,
       selector: null,
@@ -100,6 +102,7 @@ export function decodeTransaction(raw) {
   const data = payloadSlice(body, fields[dataIndex]);
 
   return {
+    raw,
     txType,
     to: toBytes.length === 20 ? '0x' + toBytes.toString('hex') : null,
     selector: data.length >= 4 ? '0x' + data.subarray(0, 4).toString('hex') : null,
