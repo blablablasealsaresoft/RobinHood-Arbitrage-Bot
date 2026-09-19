@@ -40,7 +40,9 @@
     "native:benchmark": "node native/benchmark.mjs",
     "native:audit": "node native/audit.mjs",
     "native:metrics": "node native/metrics.mjs",
-    "test:evm": "forge test --match-contract ExecutorV4Test -vv"
+    "test:evm": "forge test --match-contract ExecutorV4Test -vv",
+    "native:test:exporter": "go -C native/nitro-exporter test -race -count=1 ./...",
+    "native:test:bridge": "node scripts/test-nitro-bridge.mjs"
   },
   "dependencies": {
     "dotenv": "17.4.2",

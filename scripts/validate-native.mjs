@@ -8,18 +8,26 @@ const offline=process.argv.includes('--offline');
 if(process.argv.slice(2).some(a=>a!=='--offline'))throw new Error('usage: node scripts/validate-native.mjs [--offline]');
 const output='validation/native';fs.mkdirSync(output,{recursive:true});
 const unitFiles=fs.readdirSync('test').filter(f=>/^native-.*\.test\.mjs$/.test(f)&&f!=='native-wire.test.mjs').sort().map(f=>'test/'+f);
+const bridgeStages=[
+  ['go-version','go',['version']],
+  ['exporter-go-tests','go',['-C','native/nitro-exporter','test','-race','-json','-count=1','./...']],
+  ['exporter-installer-tests','python3',['-m','unittest','discover','-s','native/nitro-exporter','-p','install_test.py','-v']],
+  ['synthetic-bridge-integration',process.execPath,['scripts/test-nitro-bridge.mjs']],
+];
 const stages=offline?[
   ['offline-tests',process.execPath,['--test',...unitFiles]],
+  ...bridgeStages,
   ['synthetic-core-benchmark',process.execPath,['native/benchmark.mjs','10000']],
 ]:[
   ['repository-check','npm',['run','check']],
   ['executor-evm','forge',['test','--match-contract','ExecutorV4Test','-vv']],
+  ...bridgeStages,
   ['synthetic-core-benchmark',process.execPath,['native/benchmark.mjs','10000']],
 ];
 const report={schema:1,mode:offline?'offline-only':'repository-build-and-mocked-evm',startedAt:new Date().toISOString(),node:process.version,
-  productionReady:false,stages:[],unverified:['trusted Nitro execution bridge','actual venue integration and quote-domain coverage','Robinhood fork','live inclusion and gas performance','competitive ranking']};
+  productionReady:false,stages:[],unverified:['pinned Nitro observer full build and actual node execution','actual venue integration and quote-domain coverage','Robinhood fork','live inclusion and gas performance','competitive ranking']};
 for(const [name,cmd,args] of stages){
-  const t=process.hrtime.bigint(),r=spawnSync(cmd,args,{encoding:'utf8',timeout:180000,maxBuffer:32*1024*1024});
+  const t=process.hrtime.bigint(),r=spawnSync(cmd,args,{encoding:'utf8',timeout:180000,maxBuffer:32*1024*1024,env:{...process.env,GOTOOLCHAIN:'local',GOPROXY:'off',GOSUMDB:'off'}});
   const log=(r.stdout||'')+(r.stderr||'')+(r.error?'\n'+r.error.message:'');
   fs.writeFileSync(path.join(output,name+'.log'),log);
   report.stages.push({name,status:r.status===0&&!r.error?'pass':'fail',exitCode:r.status,error:r.error?.message??null,

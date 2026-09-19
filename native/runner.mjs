@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { RouteBook, MarketState, NativeEngine, NonceCoordinator, normalizeCosts, uint, address, stable } from './core.mjs';
 import { RawBroadcaster, Telemetry, RelayerJournal } from './transport.mjs';
 import { SettlementLedger } from './accounting.mjs';
+import { loadExecutionManifest, assertExecutionSocket } from './execution-provenance.mjs';
 
 export async function* frames(stream, maxBytes = 1_048_576) {
   let pending = Buffer.alloc(0);
@@ -40,10 +41,12 @@ function options(args) {
 async function preflight(config, book, nonces, record) {
   if (config.executorSchema !== 'repository-v4' || config.reviewed !== true || config.producer !== 'trusted-local-execution-bridge') throw new Error('reviewed repository-v4 deployment and trusted local execution bridge required');
   if (!process.env.NATIVE_PREFLIGHT_RPC_URL || !process.env.NATIVE_STRATEGY_KEY || !process.env.NATIVE_RELAYER_KEY) throw new Error('NATIVE_PREFLIGHT_RPC_URL, NATIVE_STRATEGY_KEY, NATIVE_RELAYER_KEY required for live');
+  const provenance = loadExecutionManifest(config, book);
   const { Contract, JsonRpcProvider, keccak256 } = await import('ethers');
   const { createWire, REPOSITORY_V4_ABI, decodeReceipt } = await import('./wire.mjs');
   const signer = createWire({ ...config.transaction, executor: config.executor,
     strategyKey: process.env.NATIVE_STRATEGY_KEY, relayerKey: process.env.NATIVE_RELAYER_KEY, record });
+  provenance.assertRelayer(signer.relayerAddress);
   const journal = new RelayerJournal(config.runtimeDirectory || 'native/.runtime', signer.relayerAddress);
   const provider = new JsonRpcProvider(process.env.NATIVE_PREFLIGHT_RPC_URL);
   try {
@@ -72,7 +75,7 @@ async function preflight(config, book, nonces, record) {
     const broadcaster = new RawBroadcaster(config.submissionUrls, { timeoutMs: config.submitTimeoutMs ?? 250, record });
     await broadcaster.warm();
     record('preflight_complete', { executor: config.executor, relayer: signer.relayerAddress });
-    return { ...signer, broadcaster, journal, ledger, decodeReceipt };
+    return { ...signer, broadcaster, journal, ledger, decodeReceipt, provenance };
   } catch (error) { journal.close(); throw error; }
   finally { provider.destroy(); }
 }
@@ -114,7 +117,8 @@ export async function run(args = process.argv.slice(2)) {
       canTrade: token => !opt.live || live.ledger.canTrade(token),
     });
     if (opt.socket) {
-      const info = fs.statSync(opt.socket);
+      if (opt.live) assertExecutionSocket(opt.socket, live.provenance.socketPath);
+      const info = fs.lstatSync(opt.socket);
       if (!info.isSocket() || (opt.live && ((info.mode & 0o077) !== 0 || info.uid !== process.getuid()))) throw new Error('live execution socket must be owner-only and owned by this process user');
       input = net.createConnection(opt.socket);
     } else input = fs.createReadStream(opt.replay);
@@ -124,6 +128,7 @@ export async function run(args = process.argv.slice(2)) {
       if (telemetry.error || (opt.live && telemetry.dropped)) { halt('telemetry persistence failed or records dropped'); input.destroy(); }
     }, 25);
     for await (const frame of frames(input)) {
+      if (opt.live) live.provenance.check(frame);
       record('decoded', { anchorBlock: String(frame.blockNumber ?? ''), anchorHash: frame.blockHash ?? null });
       if (frame.type === 'costs') { replaceCosts(frame.entries); record('costs_updated'); continue; }
       if (frame.type === 'receipt') {

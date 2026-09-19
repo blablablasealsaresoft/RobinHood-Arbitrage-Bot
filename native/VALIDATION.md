@@ -1,5 +1,27 @@
 # Native engine validation increment — 19 September 2026
 
+## Latest increment: committed-state observer
+
+`nitro-exporter/` now contains a standard-library Go observer, a source-pinned
+Nitro adapter/installer, packed-state extraction, code/storage guards, private
+Unix streaming, dedicated-relayer receipt copying and a conservative WETH cost
+policy. `execution-provenance.mjs` binds live consumption to the reviewed
+manifest, pool/code identities, relayer, source revision and signed gas budget.
+The existing generic `complete:true` claim is not sufficient for live startup.
+
+The standalone observer compiles and its race-enabled tests and Go-to-JS replay
+run without external dependencies. The adapter **has not been built as part of
+a full Nitro node**. Source-anchor installer tests use synthetic source and do
+not constitute a successful full upstream patch/build. The pinned node requires
+Go 1.25 and its usual native/Stylus dependencies.
+
+The offline validation command now includes Go race tests, Python installer
+tests and synthetic cross-language replay. Actual logs and counts, not this
+historical document, determine the current run result. The older contract tests
+and real-chain/fork gates below remain outstanding until actually executed.
+See [the observer guide](./nitro-exporter/README.md) for exact setup, trust
+boundaries, cost-policy restrictions and release evidence.
+
 ## Release status
 
 This is a **draft, non-production validation build**. No contract deployment,
@@ -133,7 +155,7 @@ as successful trades.
 ## Reproducible validation
 
 ```sh
-# No dependencies, keys or network required:
+# No npm packages, keys or network; Go/C toolchain and Python required:
 npm run native:validate:offline
 
 # Complete checkout; requires pinned npm packages and Foundry v1.4.0:

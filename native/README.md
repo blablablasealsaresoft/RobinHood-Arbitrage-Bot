@@ -15,6 +15,8 @@ component list are historical, not the current validation result.
 
 | File | Role |
 | --- | --- |
+| `nitro-exporter/` | Standard-library committed-state observer, pinned Nitro integration, owner-only socket, storage/code guards and synthetic integration tests |
+| `execution-provenance.mjs` | Live manifest, pool/code/relayer identity and conservative WETH cost-policy binding |
 | `core.mjs` | Atomic state updates, physical-pool identity checks, cached fingerprints, route templates, local sizing, EV, dedupe and nonce coordination |
 | `concentrated.mjs` | Integer Q64.96 math restricted to one integer tick; unmodeled crossings are rejected |
 | `wire.mjs` | Repository V4 ABI/EIP-712 signing, cached checks and executor receipt-event decoding |
@@ -27,8 +29,10 @@ component list are historical, not the current validation result.
 
 The hot path does not call RPC quoters. The cold audit command does use RPC and
 must remain separate. A `complete:true` frame and matching hash fields are
-producer assertions, not cryptographic proof of correct execution. The actual
-trusted Nitro execution exporter is still a production blocker.
+producer assertions, not cryptographic proof of correct execution. The in-process exporter is now implemented as a standalone tested component
+with a pinned Nitro adapter. Its full Nitro build, real-node execution and
+actual deployment parity remain production gates; see
+[nitro-exporter/README.md](./nitro-exporter/README.md).
 
 V2 quotes use exact integer reserve math. V3/static-fee hookless V4 support is
 conservatively restricted to a single integer tick. RobinFun/Pons/Curve,
@@ -44,7 +48,9 @@ npm run native:validate:offline
 npm run native:benchmark -- 10000
 ```
 
-No keys, dependencies or network are needed for these commands. Example pools,
+No keys, ethers/npm package installation, or network are needed. The expanded
+offline validator requires Linux, Go 1.23 or newer, a native C toolchain for the
+race detector, and Python 3; dry replay itself only requires Node. Example pools,
 addresses, reserves and costs are synthetic. A live replay file is refused.
 
 For dependency-installed and mocked-EVM validation on a complete checkout:

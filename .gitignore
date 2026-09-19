@@ -17,3 +17,9 @@ scanner.lock
 out/
 cache_forge/
 validation/
+
+# Local observer/runtime artifacts
+__pycache__/
+*.pyc
+*.sock
+native/nitro-exporter/*.test
