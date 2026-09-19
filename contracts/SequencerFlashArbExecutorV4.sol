@@ -93,6 +93,7 @@ contract SequencerFlashArbExecutorV4 {
 
     uint8 private phase;
     bytes32 private pendingDigest;
+    bytes32 private pendingCallbackHash;
     address private pendingSettlement;
     uint256 private pendingBorrow;
     uint256 private pendingMinProfit;
@@ -230,7 +231,9 @@ contract SequencerFlashArbExecutorV4 {
         uint256 cap = borrowCaps[intent.settlementToken];
         require(cap > 0 && intent.borrowAmount <= cap, "borrow disabled/capped");
         require(legs.length >= 2, "route too short");
+        require(legs.length <= 6, "route too long");
         require(checks.length > 0, "no state checks");
+        require(checks.length <= 8, "too many state checks");
         require(intent.routeHash == hashLegs(legs), "route hash");
         require(intent.stateChecksHash == hashStateChecks(checks), "checks hash");
 
@@ -247,11 +250,14 @@ contract SequencerFlashArbExecutorV4 {
         pendingBorrow = intent.borrowAmount;
         pendingMinProfit = intent.minProfit;
         pendingBaseline = baseline;
-        phase = 1;
+        {
+            bytes memory callbackData = abi.encode(legs);
+            pendingCallbackHash = keccak256(callbackData);
+            phase = 1; // Await exactly one authenticated callback.
+            morpho.flashLoan(intent.settlementToken, intent.borrowAmount, callbackData);
+        }
 
-        morpho.flashLoan(intent.settlementToken, intent.borrowAmount, abi.encode(legs));
-
-        require(phase == 1, "callback phase");
+        require(phase == 3, "callback phase");
         _forceApprove(intent.settlementToken, address(morpho), 0);
         uint256 afterRepay = IERC20FlashV4(intent.settlementToken).balanceOf(address(this));
         require(afterRepay >= baseline + intent.minProfit, "post-repay profit");
@@ -261,6 +267,7 @@ contract SequencerFlashArbExecutorV4 {
 
         phase = 0;
         pendingDigest = bytes32(0);
+        pendingCallbackHash = bytes32(0);
         pendingSettlement = address(0);
         pendingBorrow = 0;
         pendingMinProfit = 0;
@@ -276,6 +283,7 @@ contract SequencerFlashArbExecutorV4 {
         require(msg.sender == address(morpho), "not morpho");
         require(phase == 1, "unexpected callback");
         require(assets == pendingBorrow, "borrow mismatch");
+        require(keccak256(data) == pendingCallbackHash, "callback payload");
 
         phase = 2;
         Leg[] memory legs = abi.decode(data, (Leg[]));
@@ -306,7 +314,7 @@ contract SequencerFlashArbExecutorV4 {
         require(routeBalance >= pendingBaseline + pendingBorrow + pendingMinProfit, "pre-repay profit");
 
         _forceApprove(pendingSettlement, address(morpho), pendingBorrow);
-        phase = 1;
+        phase = 3; // Repayment-only: a second callback is never permitted.
     }
 
     function isNonceUsed(uint256 nonce) external view returns (bool) {

@@ -93,6 +93,7 @@ function poolState(metadata, update) {
     } : { protocolFee: uint(update.protocolFee, 'protocolFee', (1n << 24n) - 1n), lpFee: uint(update.lpFee, 'lpFee', 999999n) };
     if (metadata.kind === 'v3' && fields.unlocked !== true) throw new Error('locked pool');
     if (metadata.kind === 'v4' && fields.lpFee !== metadata.feePips) throw new Error('dynamic/mismatched V4 fee');
+    if (metadata.kind === 'v4' && ((fields.protocolFee & 4095n) > 1000n || (fields.protocolFee >> 12n) > 1000n)) throw new Error('invalid V4 protocol fee');
     return Object.freeze({ ...metadata, ...fields, sqrtPriceX96, tick: update.tick, liquidity, lowerX96, upperX96 });
   }
   const reserve0 = uint(update.reserve0, 'reserve0', (1n << 112n) - 1n);
@@ -103,10 +104,16 @@ function poolState(metadata, update) {
 export class RouteBook {
   constructor(pools, routes) {
     this.pools = new Map(); this.routes = new Map(); this.affected = new Map();
+    const identities = new Set();
     if (!Array.isArray(pools) || !pools.length || pools.length > 256) throw new Error('1..256 pools required');
     for (const input of pools) {
       const p = compilePool(input);
       if (this.pools.has(p.id)) throw new Error('duplicate pool id');
+      // Aliases of the same physical pool would incorrectly simulate independent
+      // liquidity and can manufacture a fictitious roundtrip profit.
+      const identity = p.kind === 'v4' ? `v4:${p.pair}:${p.poolKeyHash}` : `pair:${p.pair}`;
+      if (identities.has(identity)) throw new Error('duplicate physical pool');
+      identities.add(identity);
       this.pools.set(p.id, p); this.affected.set(p.id, new Set());
     }
     if (!Array.isArray(routes) || !routes.length || routes.length > 1024) throw new Error('1..1024 routes required');
@@ -150,6 +157,8 @@ export class RouteBook {
 export class MarketState {
   constructor(book, { clock = () => performance.now(), maxAgeMs = 250, historySize = 256 } = {}) {
     if (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0) throw new Error('positive maxAgeMs required');
+    if (!Number.isInteger(historySize) || historySize < 1 || historySize > 8192) throw new Error('historySize must be 1..8192');
+    this.frameDigests = new Map(); this.poolFingerprints = new Map();
     this.book = book; this.clock = clock; this.maxAgeMs = maxAgeMs; this.historySize = historySize;
     this.pools = new Map(); this.history = new Map(); this.blocks = new Map(); this.head = null;
     this.epoch = 0; this.ready = false; this.reason = 'bootstrap required'; this.lastAdvance = -Infinity;
@@ -183,6 +192,7 @@ export class MarketState {
       const known = this.history.get(sequence.toString());
       if (known) {
         if (known !== hash) throw new Error('sequence replacement');
+        if (this.frameDigests.get(sequence.toString()) !== fingerprint(frame)) throw new Error('conflicting duplicate execution frame');
         return null; // Replayed frames do not refresh the freshness clock.
       }
       if (sequence !== this.head.sequence + 1n || number !== this.head.number + 1n) throw new Error('sequence/block gap');
@@ -191,22 +201,28 @@ export class MarketState {
     }
     const activating = !isSnapshot && !this.ready;
     const next = isSnapshot ? new Map() : new Map(this.pools);
+    const nextFingerprints = isSnapshot ? new Map() : new Map(this.poolFingerprints);
     const changed = []; const seen = new Set();
     for (const update of frame.updates) {
       const meta = this.book.pools.get(update.poolId);
       if (!meta || seen.has(update.poolId)) throw new Error('unknown/duplicate pool update');
       seen.add(update.poolId);
-      const p = poolState(meta, update), previous = next.get(p.id);
-      if (!previous || fingerprint(p) !== fingerprint(previous)) changed.push(p.id);
-      next.set(p.id, p);
+      const p = poolState(meta, update), previous = next.get(p.id), digest = fingerprint(p);
+      const same = previous && nextFingerprints.get(p.id) === digest;
+      if (!same) changed.push(p.id);
+      next.set(p.id, same ? previous : p); nextFingerprints.set(p.id, digest);
     }
     // Publish only after every field/update validated: no partially applied block.
-    if (isSnapshot) { this.history.clear(); this.blocks.clear(); this.epoch++; }
-    this.pools = next; this.head = Object.freeze({ sequence, number, hash, parent, timestamp });
+    if (isSnapshot) { this.history.clear(); this.blocks.clear(); this.frameDigests.clear(); this.epoch++; }
+    this.pools = next; this.poolFingerprints = nextFingerprints; this.head = Object.freeze({ sequence, number, hash, parent, timestamp });
     this.history.set(sequence.toString(), hash);
+    this.frameDigests.set(sequence.toString(), fingerprint(frame));
     this.blocks.set(number.toString(), hash);
     while (this.blocks.size > this.historySize) this.blocks.delete(this.blocks.keys().next().value);
-    while (this.history.size > this.historySize) this.history.delete(this.history.keys().next().value);
+    while (this.history.size > this.historySize) {
+      const oldest = this.history.keys().next().value;
+      this.history.delete(oldest); this.frameDigests.delete(oldest);
+    }
     this.lastAdvance = this.clock(); this.ready = !isSnapshot;
     this.reason = isSnapshot ? 'awaiting contiguous block' : '';
     return { head: this.head, changed: activating ? [...this.book.pools.keys()] : changed, ready: this.ready, epoch: this.epoch };
@@ -292,6 +308,7 @@ export function normalizeCosts(input, settlementToken) {
   const denominator = uint(input.settlementUnitsPerWeiDenominator);
   if (!numerator || !denominator) throw new Error('positive gas conversion required');
   return Object.freeze({ settlementToken,
+    settlementUnitsPerWeiNumerator: numerator, settlementUnitsPerWeiDenominator: denominator,
     validUntilBlock: uint(input.validUntilBlock),
     successGasCost: ceilDiv(uint(input.successGasWei) * numerator, denominator),
     revertGasCost: ceilDiv(uint(input.revertGasWei) * numerator, denominator),
@@ -348,46 +365,50 @@ export class NonceCoordinator {
 }
 
 export class NativeEngine {
-  constructor({ book, state, costs, wire, broadcaster, nonces, live = false, record = () => {}, beforeSend = () => {} }) {
-    Object.assign(this, { book, state, costs, wire, broadcaster, nonces, live, record, beforeSend });
+  constructor({ book, state, costs, wire, broadcaster, nonces, live = false, record = () => {}, beforeSend = () => {}, beforeDispatch = () => {}, canTrade = () => true }) {
+    Object.assign(this, { book, state, costs, wire, broadcaster, nonces, live, record, beforeSend, beforeDispatch, canTrade });
     this.dedupe = new OpportunityDedupe(); this.working = false; this.lastEpoch = state.epoch;
   }
   async onFrame(frame) {
-    this.record('frame_received');
+    const trace = { anchorBlock: String(frame.blockNumber ?? ''), anchorHash: frame.blockHash ?? null };
+    this.record('frame_received', trace);
     this.state.healthy();
     let change;
     try { change = this.state.ingest(frame); } catch (error) { if (this.live) this.nonces.uncertain(); throw error; }
     if (this.live && frame.type === 'invalidate') this.nonces.uncertain();
-    this.record('state_updated');
+    this.record('state_updated', trace);
     if (this.lastEpoch !== this.state.epoch) { this.dedupe.clear(); this.lastEpoch = this.state.epoch; }
     if (!change?.ready || this.working || !this.state.healthy()) return null;
     const { head, epoch } = change;
     if (this.live && !this.nonces.available()) { this.record('nonce_backpressure'); return null; }
     let best = null;
     for (const route of this.book.affectedRoutes(change.changed)) {
+      if (!this.canTrade(route.settlementToken)) { this.record('risk_backpressure', trace); continue; }
       const costs = this.costs.get(route.settlementToken);
       if (!costs || costs.validUntilBlock < head.number + 1n) continue;
       const q = optimizeRoute(route, this.state.pools);
       if (!q || q.grossProfit < route.minProfit) continue;
       const gate = expectedValueGate({ grossProfit: q.grossProfit, ...costs });
       if (!gate.pass) continue;
-      const candidate = { ...q, ...gate, route };
+      const candidate = { ...q, ...gate, route, costs };
       // Native units of distinct settlement tokens are not comparable. Book order
       // is the explicit priority between tokens; compare EV only within a token.
       if (!best || (best.route.settlementToken === route.settlementToken && candidate.expectedNumerator > best.expectedNumerator)) best = candidate;
     }
-    this.record('q_optimized');
+    this.record('q_optimized', trace);
     if (!best) return null;
     const selectedPools = best.route.legs.map(l => this.state.pools.get(l.poolId));
-    const relevantStateHash = fingerprint(selectedPools);
+    const relevantStateHash = fingerprint(best.route.legs.map(l => this.state.poolFingerprints.get(l.poolId)));
     const key = fingerprint([head.hash, best.route.templateHash, best.route.settlementToken, relevantStateHash]);
     if (!this.dedupe.take(key, head.number)) return null;
     const opportunity = { ...best, head, epoch, key, relevantStateHash, pools: selectedPools };
-    this.record('opportunity_found', { key, anchorBlock: head.number.toString(), grossProfit: best.grossProfit.toString() });
+    this.record('opportunity_found', { ...trace, key, routeId: best.route.id, amount: best.amount.toString(), grossProfit: best.grossProfit.toString() });
     if (!this.live) return opportunity;
     this.working = true;
     let nonce = null, dispatched = false;
-    const fresh = () => this.state.matches(head, epoch);
+    // Recheck costs and risk after asynchronous signing/journaling too. A cost
+    // revision must not leave an old positive-EV decision sendable.
+    const fresh = () => this.state.matches(head, epoch) && this.costs.get(best.route.settlementToken) === best.costs && (dispatched || this.canTrade(best.route.settlementToken));
     try {
       if (!fresh()) return null;
       nonce = this.nonces.reserve();
@@ -399,6 +420,8 @@ export class NativeEngine {
       await this.beforeSend({ nonce, ...signed, anchorBlock: head.number, key });
       if (!fresh()) { this.nonces.releaseUnsent(nonce); nonce = null; return null; }
       this.nonces.submitted(nonce, signed.hash); dispatched = true;
+      // Register before POST: a receipt can arrive before its HTTP ACK.
+      this.beforeDispatch({ nonce, ...signed, anchorBlock: head.number, key }, opportunity);
       const sent = await this.broadcaster.broadcast(signed.raw, signed.hash, fresh);
       this.record('accepted', { key, txHash: signed.hash, path: sent.path });
       return { ...opportunity, hash: signed.hash, nonce };

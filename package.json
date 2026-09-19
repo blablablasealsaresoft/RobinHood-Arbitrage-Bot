@@ -34,7 +34,13 @@
     "feed:edge": "python3.11 sequencer/rh_feed_edge.py",
     "native:replay": "node native/runner.mjs --config native/example.json --replay native/example.ndjson",
     "native:monitor": "node native/runner.mjs",
-    "test:native": "node --test test/native-*.test.mjs"
+    "test:native": "node --test test/native-*.test.mjs",
+    "native:validate": "node scripts/validate-native.mjs",
+    "native:validate:offline": "node scripts/validate-native.mjs --offline",
+    "native:benchmark": "node native/benchmark.mjs",
+    "native:audit": "node native/audit.mjs",
+    "native:metrics": "node native/metrics.mjs",
+    "test:evm": "forge test --match-contract ExecutorV4Test -vv"
   },
   "dependencies": {
     "dotenv": "17.4.2",

@@ -13,6 +13,7 @@ export const REPOSITORY_V4_ABI = [
   'function paused() view returns (bool)', 'function maxBlockWindow() view returns (uint64)',
   'function maxAnchorDelay() view returns (uint64)', 'function domainSeparator() view returns (bytes32)',
   'function morpho() view returns (address)',
+  'event FlashArbitrage(bytes32 indexed digest,uint64 indexed anchorBlock,bytes32 indexed anchorBlockHash,bytes32 triggerTxHash,address settlementToken,uint256 borrowed,uint256 profit,address relayer)',
 ];
 const execI = new Interface(REPOSITORY_V4_ABI);
 const v3I = new Interface(['function slot0() view returns (uint160,int24,uint16,uint16,uint16,uint8,bool)', 'function liquidity() view returns (uint128)']);
@@ -67,7 +68,8 @@ export function createWire({ executor, strategyKey, relayerKey, gasLimit, maxFee
     record('intent_signed', { key });
     const data = execI.encodeFunctionData('executeFlashArb', [intent, legs, checks, signature]);
     const raw = await relayer.signTransaction({ ...skeleton, nonce: Number(uint(nonce, 'EOA nonce', BigInt(Number.MAX_SAFE_INTEGER))), data });
-    return { raw, hash: keccak256(raw), intent };
+    record('raw_signed', { key });
+    return { raw, hash: keccak256(raw), intent, intentDigest: TypedDataEncoder.hash(domain, FLASH_INTENT_TYPES, intent), gasLimit, maxFeePerGas };
   };
   // A fresh namespace avoids colliding with signatures from a different relayer
   // or a prior process while consuming adjacent nonce-bitmap bits in this session.
@@ -87,3 +89,21 @@ export const FINAL_V4_TYPES = { FlashArbIntent: [
 export const finalDomain = executor => ({ name: 'RobinhoodSequencerFlashArb', version: '4', chainId: 4663, verifyingContract: getAddress(executor) });
 export const finalLegsHash = legs => keccak256(coder.encode([`${legTuple}[]`], [legs]));
 export const finalChecksHash = checks => keccak256(coder.encode([`${finalCheckTuple}[]`], [checks]));
+
+// Decode only this executor's event from full receipt logs. An upstream arbitrary
+// `profit` field is never accepted as realized P&L by the live runner.
+export function decodeReceipt(receipt, executor) {
+  if (!Array.isArray(receipt.logs) || receipt.logs.length > 4096) throw new Error('bounded full receipt logs required');
+  executor = getAddress(executor);
+  const topic = execI.getEvent('FlashArbitrage').topicHash;
+  const arbitrageEvents = [];
+  for (const log of receipt.logs) {
+    if (getAddress(log.address) !== executor || log.topics?.[0]?.toLowerCase() !== topic.toLowerCase()) continue;
+    if (log.removed === true) throw new Error('removed executor log');
+    const parsed = execI.parseLog(log), e = parsed.args;
+    arbitrageEvents.push({ emitter: executor, digest: e.digest, anchorBlock: e.anchorBlock,
+      anchorBlockHash: e.anchorBlockHash, settlementToken: e.settlementToken,
+      borrowed: e.borrowed, profit: e.profit, relayer: e.relayer });
+  }
+  return { ...receipt, arbitrageEvents };
+}

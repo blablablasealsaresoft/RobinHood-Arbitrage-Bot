@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import solc from 'solc';
 import { AbiCoder, Interface, Transaction, TypedDataEncoder, Wallet, keccak256, verifyTypedData } from 'ethers';
 import { RouteBook, MarketState, NativeEngine, normalizeCosts } from '../native/core.mjs';
-import { createWire, stateChecks, REPOSITORY_V4_ABI, FINAL_V4_TYPES, finalDomain, finalLegsHash, finalChecksHash } from '../native/wire.mjs';
+import { createWire, stateChecks, decodeReceipt, REPOSITORY_V4_ABI, FINAL_V4_TYPES, finalDomain, finalLegsHash, finalChecksHash } from '../native/wire.mjs';
 import { FLASH_INTENT_TYPES, hashLegs, hashStateChecks, intentDomain } from '../flash-intent.js';
 const executor = '0x' + 'a'.repeat(40);
 // PUBLIC TEST KEYS ONLY. Never fund or use them outside these offline tests.
@@ -55,4 +55,21 @@ test('uploaded final ABI is explicitly separate, including state-check gas limit
   assert.notEqual(TypedDataEncoder.hashDomain(finalDomain(executor)), TypedDataEncoder.hashDomain(intentDomain(executor)));
   assert.equal(FINAL_V4_TYPES.FlashArbIntent.length, 11);
   assert.equal(finalDomain(executor).version, '4');
+});
+
+test('receipt decoder binds the executor emitter and decodes the real event', () => {
+  const iface = new Interface(REPOSITORY_V4_ABI);
+  const encoded = iface.encodeEventLog(iface.getEvent('FlashArbitrage'), [
+    '0x'+'1'.repeat(64),101n,'0x'+'2'.repeat(64),'0x'+'0'.repeat(64),executor,100n,3n,new Wallet(relayerKey).address,
+  ]);
+  const decoded = decodeReceipt({ logs: [{ address: executor, ...encoded }], arbitrageEvents: ['untrusted'] },executor);
+  assert.equal(decoded.arbitrageEvents.length,1);assert.equal(decoded.arbitrageEvents[0].profit,3n);
+  assert.equal(decodeReceipt({logs:[{address:'0x'+'b'.repeat(40),...encoded}]},executor).arbitrageEvents.length,0);
+  assert.throws(()=>decodeReceipt({logs:[{address:executor,removed:true,...encoded}]},executor),/removed/);
+});
+test('wire exports signed limits and EIP-712 digest for receipt/risk matching', async () => {
+  const q=await opportunity(), signer=createWire({executor,strategyKey,relayerKey,gasLimit:800000n,maxFeePerGas:100n});
+  const signed=await signer.wire(q,9n);
+  assert.equal(signed.intentDigest,TypedDataEncoder.hash(intentDomain(executor),FLASH_INTENT_TYPES,signed.intent));
+  assert.equal(signed.gasLimit,800000n);assert.equal(signed.maxFeePerGas,100n);
 });

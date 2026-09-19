@@ -5,6 +5,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { RouteBook, MarketState, NativeEngine, NonceCoordinator, normalizeCosts, uint, address, stable } from './core.mjs';
 import { RawBroadcaster, Telemetry, RelayerJournal } from './transport.mjs';
+import { SettlementLedger } from './accounting.mjs';
 
 export async function* frames(stream, maxBytes = 1_048_576) {
   let pending = Buffer.alloc(0);
@@ -40,7 +41,7 @@ async function preflight(config, book, nonces, record) {
   if (config.executorSchema !== 'repository-v4' || config.reviewed !== true || config.producer !== 'trusted-local-execution-bridge') throw new Error('reviewed repository-v4 deployment and trusted local execution bridge required');
   if (!process.env.NATIVE_PREFLIGHT_RPC_URL || !process.env.NATIVE_STRATEGY_KEY || !process.env.NATIVE_RELAYER_KEY) throw new Error('NATIVE_PREFLIGHT_RPC_URL, NATIVE_STRATEGY_KEY, NATIVE_RELAYER_KEY required for live');
   const { Contract, JsonRpcProvider, keccak256 } = await import('ethers');
-  const { createWire, REPOSITORY_V4_ABI } = await import('./wire.mjs');
+  const { createWire, REPOSITORY_V4_ABI, decodeReceipt } = await import('./wire.mjs');
   const signer = createWire({ ...config.transaction, executor: config.executor,
     strategyKey: process.env.NATIVE_STRATEGY_KEY, relayerKey: process.env.NATIVE_RELAYER_KEY, record });
   const journal = new RelayerJournal(config.runtimeDirectory || 'native/.runtime', signer.relayerAddress);
@@ -65,10 +66,13 @@ async function preflight(config, book, nonces, record) {
     for (const p of book.pools.values()) if (!(await executor.adapters(p.adapter))) throw new Error('adapter not approved');
     for (const route of book.routes.values()) if (await executor.borrowCaps(route.settlementToken) < route.maxInput) throw new Error('on-chain borrow cap below route size');
     nonces.bootstrap({ latest: BigInt(latest), pending: BigInt(pending) });
+    const ledger = new SettlementLedger({ executor: config.executor, relayer: signer.relayerAddress, lossLimits: config.sessionLossLimits });
+    for (const route of book.routes.values()) if (!ledger.canTrade(route.settlementToken)) throw new Error('missing session loss limit for settlement');
+    if (config.receiptFeeModel !== 'gasUsed-times-effectiveGasPrice-inclusive') throw new Error('reviewed inclusive receipt fee model required');
     const broadcaster = new RawBroadcaster(config.submissionUrls, { timeoutMs: config.submitTimeoutMs ?? 250, record });
     await broadcaster.warm();
     record('preflight_complete', { executor: config.executor, relayer: signer.relayerAddress });
-    return { ...signer, broadcaster, journal };
+    return { ...signer, broadcaster, journal, ledger, decodeReceipt };
   } catch (error) { journal.close(); throw error; }
   finally { provider.destroy(); }
 }
@@ -103,6 +107,11 @@ export async function run(args = process.argv.slice(2)) {
     const engine = new NativeEngine({ book, state, costs, nonces, live: opt.live, record,
       wire: live?.wire, broadcaster: live?.broadcaster,
       beforeSend: entry => { live.journal.append({ type: 'signed', ...entry }); record('journal_persisted', { key: entry.key }); },
+      beforeDispatch: (entry, opportunity) => {
+        live.ledger.register(entry, opportunity);
+        live.journal.append({ type: 'dispatch', nonce: entry.nonce, txHash: entry.hash, key: entry.key });
+      },
+      canTrade: token => !opt.live || live.ledger.canTrade(token),
     });
     if (opt.socket) {
       const info = fs.statSync(opt.socket);
@@ -112,19 +121,26 @@ export async function run(args = process.argv.slice(2)) {
     process.once('SIGINT', stop); process.once('SIGTERM', stop);
     if (opt.socket) timer = setInterval(() => {
       if (state.ready && !state.healthy()) halt('execution stream stalled');
-      if (telemetry.error) { halt('telemetry persistence failed'); input.destroy(); }
+      if (telemetry.error || (opt.live && telemetry.dropped)) { halt('telemetry persistence failed or records dropped'); input.destroy(); }
     }, 25);
     for await (const frame of frames(input)) {
-      record('decoded');
+      record('decoded', { anchorBlock: String(frame.blockNumber ?? ''), anchorHash: frame.blockHash ?? null });
       if (frame.type === 'costs') { replaceCosts(frame.entries); record('costs_updated'); continue; }
       if (frame.type === 'receipt') {
         if (!opt.live) continue;
-        const block = uint(frame.blockNumber), known = state.blocks.get(block.toString()) === String(frame.blockHash).toLowerCase();
-        if (!known || !state.head || block > state.head.number || ![0, 1].includes(frame.status)) throw new Error('receipt not tied to observed executed chain');
-        nonces.included(frame.nonce, frame.txHash);
-        live.journal.append({ type: 'receipt', ...frame });
-        record('included', { nonce: frame.nonce, txHash: frame.txHash, executionBlock: frame.blockNumber, status: frame.status, gasUsed: frame.gasUsed ?? null });
+        const decoded = live.decodeReceipt(frame, config.executor);
+        const result = live.ledger.settle(decoded, (number, hash) => state.blocks.get(number.toString()) === hash);
+        if (result) {
+          nonces.included(result.nonce, result.txHash);
+          live.journal.append({ type: 'receipt', ...result });
+          record('included', { nonce: result.nonce.toString(), txHash: result.txHash, executionBlock: result.blockNumber.toString(), status: result.status });
+          record('realized_pnl', result);
+        }
         continue;
+      }
+      if (opt.live && frame.type === 'invalidate') {
+        const removedTxHashes = live.ledger.invalidateFrom(frame.fromBlock ?? 0);
+        record('accounting_invalidated', { ...live.ledger.summary(), removedTxHashes });
       }
       if (opt.live && frame.type !== 'invalidate') {
         const seconds = Number(uint(frame.timestamp, 'timestamp', BigInt(Number.MAX_SAFE_INTEGER)));
@@ -144,7 +160,7 @@ export async function run(args = process.argv.slice(2)) {
     }
     halt('execution stream closed');
     await Promise.allSettled(tasks);
-    return { mode: opt.live ? 'live' : 'dry', opportunities, failures, interrupted };
+    return { mode: opt.live ? 'live' : 'dry', opportunities, failures, interrupted, ...(live ? { accounting: live.ledger.summary() } : {}) };
   } finally {
     halt('runner stopped'); clearInterval(timer); input?.destroy();
     process.off('SIGINT', stop); process.off('SIGTERM', stop);

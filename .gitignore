@@ -12,3 +12,8 @@ scanner-cache.json
 scanner-cache.json.tmp
 scanner.lock
 .DS_Store
+
+# Validation / Foundry outputs
+out/
+cache_forge/
+validation/
