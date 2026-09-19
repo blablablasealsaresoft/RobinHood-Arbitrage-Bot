@@ -6,6 +6,8 @@
 // parsing independent from Nitro's internal L2-message encoding while still
 // allowing the arb engine to react immediately to newly sequenced work.
 
+import { decodeFeedTransactions } from './sequencer-codec.js';
+
 const DEFAULT_URL = 'wss://feed.mainnet.chain.robinhood.com';
 
 export class SequencerFeedClient {
@@ -17,6 +19,8 @@ export class SequencerFeedClient {
     reconnectMinMs = 500,
     reconnectMaxMs = 15000,
     idleTimeoutMs = 30000,
+    maxLiveAgeMs = 5000,
+    decodeTransactions = true,
     now = Date.now,
   } = {}) {
     this.url = url;
@@ -26,6 +30,8 @@ export class SequencerFeedClient {
     this.reconnectMinMs = reconnectMinMs;
     this.reconnectMaxMs = reconnectMaxMs;
     this.idleTimeoutMs = idleTimeoutMs;
+    this.maxLiveAgeMs = maxLiveAgeMs;
+    this.decodeTransactions = decodeTransactions;
     this.now = now;
 
     this.ws = null;
@@ -159,6 +165,13 @@ export class SequencerFeedClient {
     const lastSequenceNumber = sequenceNumbers.length
       ? String(sequenceNumbers[sequenceNumbers.length - 1])
       : null;
+    const timestamps = messages
+      .map((m) => Number(m?.message?.message?.header?.timestamp || 0))
+      .filter((v) => Number.isFinite(v) && v > 0);
+    const latestTimestamp = timestamps.length ? Math.max(...timestamps) : 0;
+    const messageAgeMs = latestTimestamp ? receivedAt - latestTimestamp * 1000 : null;
+    const live = messageAgeMs !== null && messageAgeMs <= this.maxLiveAgeMs;
+    const transactions = this.decodeTransactions ? decodeFeedTransactions(parsed) : [];
 
     this.stats.frames++;
     this.stats.messages += messages.length;
@@ -171,6 +184,10 @@ export class SequencerFeedClient {
       messageCount: messages.length,
       lastSequenceNumber,
       frameBytes: Buffer.byteLength(text),
+      latestTimestamp,
+      messageAgeMs,
+      live,
+      transactions,
     });
   }
 }
