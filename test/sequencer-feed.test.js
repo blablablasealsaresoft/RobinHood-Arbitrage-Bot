@@ -42,7 +42,10 @@ test('sequencer feed parses Nitro broadcast envelopes and tracks sequence', asyn
   now = 1015;
   ws.emit('message', { data: JSON.stringify({
     version: 1,
-    messages: [{ sequenceNumber: 41 }, { sequenceNumber: 42 }],
+    messages: [
+      { sequenceNumber: 41, message: { message: { header: { timestamp: 1 } } } },
+      { sequenceNumber: 42, message: { message: { header: { timestamp: 1 } } } },
+    ],
   }) });
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -50,6 +53,8 @@ test('sequencer feed parses Nitro broadcast envelopes and tracks sequence', asyn
   assert.equal(batches[0].messageCount, 2);
   assert.equal(batches[0].lastSequenceNumber, '42');
   assert.equal(batches[0].receivedAt, 1015);
+  assert.equal(batches[0].live, true);
+  assert.equal(batches[0].messageAgeMs, 15);
   assert.equal(client.snapshot().frames, 1);
   assert.equal(client.snapshot().messages, 2);
   assert.equal(client.snapshot().lastSequenceNumber, '42');
