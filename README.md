@@ -1,3 +1,22 @@
+# Production strategy: Robinhood sequencer flash arb
+
+The primary runtime on this branch is now `sequencer-bot.js`: one verified-sequencer, next-L2-block, WETH-settled Morpho flash-arbitrage strategy.
+
+See **[docs/SEQUENCER_PRODUCTION.md](docs/SEQUENCER_PRODUCTION.md)** for architecture, deployment, ArbSys anchoring, expected-value gating, and pre-live validation.
+
+Primary commands:
+
+```bash
+npm run check
+npm run deploy
+npm run monitor
+npm run live
+```
+
+The older funded executor/scanner implementation remains in the repository for history and comparison but is not the primary production path.
+
+---
+
 # RobinHood Arbitrage Bot
 
 > Indonesian documentation: [README.id.md](README.id.md)
