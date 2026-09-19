@@ -26,7 +26,8 @@
     "allow-pools": "node allow-pools.js",
     "pause": "node executor-admin.js pause",
     "unpause": "node executor-admin.js unpause",
-    "sequencer:smoke": "node scripts/sequencer-smoke.js"
+    "sequencer:smoke": "node scripts/sequencer-smoke.js",
+    "deploy:sequencer": "node deploy-sequencer.js"
   },
   "dependencies": {
     "dotenv": "17.4.2",
