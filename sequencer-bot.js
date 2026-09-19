@@ -3,7 +3,7 @@ import 'dotenv/config';
 import { spawn } from 'node:child_process';
 import readline from 'node:readline';
 import {
-  Contract, JsonRpcProvider, Network, Wallet, formatEther, parseEther, keccak256,
+  Contract, Interface, JsonRpcProvider, Network, Wallet, formatEther, parseEther, keccak256,
 } from 'ethers';
 import { CURVE, V4, TOKEN, POOLS, WETH } from './config.js';
 import { bpsDown, buildGrid, envInteger } from './risk.js';
@@ -80,7 +80,7 @@ if (LIVE && (!relayerWallet || !strategyWallet)) {
 }
 
 const executor = new Contract(CFG.executor, EXECUTOR_ABI, relayerWallet || provider);
-const routeQuoter = new Contract(CFG.routeQuoter, ROUTE_QUOTER_ABI, provider);
+const ROUTE_QUOTER_I = new Interface(ROUTE_QUOTER_ABI);
 const sizes = buildGrid(CFG.minSize, CFG.maxSize, CFG.gridPoints);
 const dedupe = new OpportunityDedupe();
 const telemetry = new Telemetry();
@@ -116,33 +116,65 @@ async function startupChecks() {
 }
 
 async function quoteAnchor(anchorBlock) {
-  const tasks = [];
+  const calls = [];
   for (const pool of POOLS) {
     for (const size of sizes) {
-      tasks.push(
-        routeQuoter.quoteCurveToV4.staticCall(
-          TOKEN.address, size, poolKeyTuple(pool.key), { blockTag: anchorBlock },
-        ).then(r => ({
-          direction: 'curve->v4', pool, size,
-          tokenOut: r[0], wethOut: r[1], quoteGas: r[2],
-        })).catch(() => null)
-      );
-      tasks.push(
-        routeQuoter.quoteV4ToCurve.staticCall(
-          TOKEN.address, size, poolKeyTuple(pool.key), { blockTag: anchorBlock },
-        ).then(r => ({
-          direction: 'v4->curve', pool, size,
-          tokenOut: r[0], wethOut: r[1], quoteGas: r[2],
-        })).catch(() => null)
-      );
+      calls.push({
+        direction: 'curve->v4', pool, size,
+        data: ROUTE_QUOTER_I.encodeFunctionData(
+          'quoteCurveToV4', [TOKEN.address, size, poolKeyTuple(pool.key)]
+        ),
+      });
+      calls.push({
+        direction: 'v4->curve', pool, size,
+        data: ROUTE_QUOTER_I.encodeFunctionData(
+          'quoteV4ToCurve', [TOKEN.address, size, poolKeyTuple(pool.key)]
+        ),
+      });
     }
   }
 
-  const quoted = (await Promise.all(tasks)).filter(Boolean);
-  let best = null;
+  const blockTag = '0x' + BigInt(anchorBlock).toString(16);
+  const payload = calls.map((c, i) => ({
+    jsonrpc: '2.0',
+    id: i + 1,
+    method: 'eth_call',
+    params: [{ to: CFG.routeQuoter, data: c.data }, blockTag],
+  }));
+  const response = await fetch(CFG.localRpc, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', connection: 'keep-alive' },
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json();
+  if (!Array.isArray(result)) throw new Error('local RPC did not return a batch');
+  const byId = new Map(result.map(x => [x.id, x]));
+
   const successGasCost = CFG.gasUnits * CFG.modelGasPrice;
   const revertGasCost = CFG.revertGasUnits * CFG.modelGasPrice;
-  for (const q of quoted) {
+  let best = null;
+
+  for (let i = 0; i < calls.length; i++) {
+    const item = byId.get(i + 1);
+    if (!item || item.error || typeof item.result !== 'string') continue;
+    let decoded;
+    try {
+      decoded = ROUTE_QUOTER_I.decodeFunctionResult(
+        calls[i].direction === 'curve->v4' ? 'quoteCurveToV4' : 'quoteV4ToCurve',
+        item.result,
+      );
+    } catch {
+      continue;
+    }
+
+    const q = {
+      ...calls[i],
+      tokenOut: decoded[0],
+      wethOut: decoded[1],
+      quoteGas: decoded[2],
+    };
+    delete q.data;
+
     if (q.wethOut <= q.size) continue;
     const grossProfit = q.wethOut - q.size;
     if (grossProfit < CFG.onchainMinProfit) continue;
@@ -154,6 +186,7 @@ async function quoteAnchor(anchorBlock) {
       minExpectedValue: CFG.minExpectedWei,
     });
     if (!gate.pass) continue;
+
     const candidate = { ...q, grossProfit, ...gate };
     if (!best || candidate.expectedValue > best.expectedValue) best = candidate;
   }
@@ -163,6 +196,7 @@ async function quoteAnchor(anchorBlock) {
 async function buildExecution(anchor, best) {
   const checks = await buildExactStateChecks({
     provider,
+    rpcUrl: CFG.localRpc,
     anchorBlock: anchor.blockNumber,
     curve: CURVE.address,
     stateView: V4.stateView,
