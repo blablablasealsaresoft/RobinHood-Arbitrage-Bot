@@ -64,7 +64,7 @@ test('flash intent hashes route/state and recovers EIP-712 strategy signer', asy
 
   const recovered = verifyTypedData(
     {
-      name: 'SequencerFlashArbExecutorV3',
+      name: 'SequencerFlashArbExecutorV4',
       version: '1',
       chainId: 4663,
       verifyingContract: executor,
