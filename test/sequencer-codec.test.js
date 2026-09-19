@@ -8,16 +8,16 @@ test('decodes signed transactions nested in a captured Robinhood Nitro batch', (
   const txs = decodeL2Message(Buffer.from(VERIFIED_L2_MSG, 'base64'));
   assert.equal(txs.length, 2);
 
-  assert.deepEqual(txs[0], {
-    txType: 0,
-    to: '0x7a764763d13d17e3e9dada5b0371b280def1046a',
-    selector: null,
-    valueWei: '1275274803487',
-    nonce: '2701',
-    gas: '24344',
-    dataLength: 0,
-  });
+  assert.ok(Buffer.isBuffer(txs[0].raw));
+  assert.equal(txs[0].txType, 0);
+  assert.equal(txs[0].to, '0x7a764763d13d17e3e9dada5b0371b280def1046a');
+  assert.equal(txs[0].selector, null);
+  assert.equal(txs[0].valueWei, '1275274803487');
+  assert.equal(txs[0].nonce, '2701');
+  assert.equal(txs[0].gas, '24344');
+  assert.equal(txs[0].dataLength, 0);
 
+  assert.ok(Buffer.isBuffer(txs[1].raw));
   assert.equal(txs[1].txType, 2);
   assert.equal(txs[1].to, '0x73991a25c818bf1f1128deaab1492d45638de0d3');
   assert.equal(txs[1].selector, '0xfc6f7865');
