@@ -1,0 +1,12 @@
+//go:build !wasm && !linux
+
+// The observer transport is intentionally Linux-only. Other Nitro builds keep
+// their original behavior and do not expose an execution socket.
+package gethexec
+
+import "github.com/ethereum/go-ethereum/core/types"
+
+type nativeArbExportState struct{}
+
+func (s *ExecutionEngine) nativeArbExportBlock(*types.Block, types.Receipts) {}
+func (s *ExecutionEngine) nativeArbExportInvalidate(uint64)                  {}

@@ -31,6 +31,7 @@ test('sequencer feed parses Nitro broadcast envelopes and tracks sequence', asyn
     WebSocketImpl: FakeWebSocket,
     now: () => now,
     idleTimeoutMs: 60000,
+    verifySignatures: false,
     onBatch: (b) => batches.push(b),
     onStatus: (s) => statuses.push(s.type),
   });
@@ -60,6 +61,33 @@ test('sequencer feed parses Nitro broadcast envelopes and tracks sequence', asyn
   assert.equal(client.snapshot().lastSequenceNumber, '42');
   assert.deepEqual(statuses, ['connected']);
 
+  client.stop();
+});
+
+test('sequencer feed rejects unsigned envelopes when signature verification is enabled', async () => {
+  FakeWebSocket.instances.length = 0;
+  const batches = [];
+  const client = new SequencerFeedClient({
+    WebSocketImpl: FakeWebSocket,
+    idleTimeoutMs: 60000,
+    onBatch: (b) => batches.push(b),
+  });
+
+  client.start();
+  const ws = FakeWebSocket.instances[0];
+  ws.emit('open');
+  ws.emit('message', { data: JSON.stringify({
+    version: 1,
+    messages: [
+      { sequenceNumber: 41, message: { message: { header: { timestamp: 1 } } } },
+      { sequenceNumber: 42, message: { message: { header: { timestamp: 1 } } } },
+    ],
+  }) });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(batches.length, 0);
+  assert.equal(client.snapshot().unverifiedMessages, 2);
+  assert.equal(client.snapshot().frames, 0);
   client.stop();
 });
 

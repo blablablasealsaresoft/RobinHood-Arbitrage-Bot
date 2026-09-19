@@ -1,0 +1,15 @@
+[profile.default]
+src = "contracts"
+test = "test/evm"
+out = "out"
+cache_path = "cache_forge"
+solc_version = "0.8.26"
+evm_version = "paris"
+optimizer = true
+optimizer_runs = 500
+# Keep the bytecode compilation path aligned with scripts/compile.js.
+via_ir = false
+
+[profile.default.fuzz]
+runs = 256
+seed = "0x4663"

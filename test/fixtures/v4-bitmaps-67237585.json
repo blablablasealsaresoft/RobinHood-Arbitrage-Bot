@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "kind": "captured-historical-v4-bitmaps",
+  "provider": "Alchemy PRospera Rewards",
+  "chainId": 4663,
+  "blockNumber": 67237585,
+  "blockTag": "0x401f6d1",
+  "headerAfter": {
+    "number": "0x401f6d1",
+    "hash": "0x56a6d5be13ea6ad93fcc7d987c4958a2177052540c358a85c435441d8f8533db",
+    "parentHash": "0xe13235be6031bb9a62d409bd5ea5cb5c36bc418b6c3b11c3f2a72142c6c82fc3",
+    "stateRoot": "0xa651ee9d41f456a840f615af0eb2e4d348fbae8f0de93911b20632999adfd0fd",
+    "timestamp": "0x6aaebcf7"
+  },
+  "collectionDateUTC": "2026-09-19",
+  "poolManager": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+  "sourceLayoutRevision": "46c6834698c48bc4a463a86d8420f4eb1d7f3b75",
+  "pools": [
+    {
+      "poolId": "0x0535a5a6095fdb5293563f435a635cab5fcf0511e732158086fdc9721feb6362",
+      "tickSpacing": 5000,
+      "minWord": -1,
+      "maxWord": 0,
+      "poolStateSlot": "0x4f6b1e7647172ed86cd591934a40877b493e0df230bdd8e87d93ecc10292b51a",
+      "coversEveryLegalTick": true,
+      "bitmaps": [
+        {
+          "wordPosition": -1,
+          "slot": "0x1488d150818ce25316695c67fdcc1626ffb221721183eb7dbf47dc17d9c1237d",
+          "result": "0x0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "wordPosition": 0,
+          "slot": "0x1a99ca14409c67fca2238cacbdb610d40a1c34c1d11e93ec8c7304e9aaa969f5",
+          "result": "0x0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    },
+    {
+      "poolId": "0x3c0c454af4afbd7619fd7a67059fb1b65188442b91d70f8bedf0c986d837b326",
+      "tickSpacing": 2000,
+      "minWord": -2,
+      "maxWord": 1,
+      "poolStateSlot": "0x8aaee7f5a3222e7fd2137f070ffd7d28d771e0e7e859bdaaf785427a327cbfcc",
+      "coversEveryLegalTick": true,
+      "bitmaps": [
+        {
+          "wordPosition": -2,
+          "slot": "0x6ea6474ecf718caa36347beffa0e42a4aae801a957bf74c09ef2390b199fe359",
+          "result": "0x0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "wordPosition": -1,
+          "slot": "0x98b82960afb99e046a62c48a9e53a1518bd807961acc1cba2609965f8598c8e9",
+          "result": "0x0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "wordPosition": 0,
+          "slot": "0x8c18d62506fe7f5b4c54616384dc69a4d16cd38988dd8e60132de08f41bee031",
+          "result": "0x0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "wordPosition": 1,
+          "slot": "0xd1a95c9d0ee2d29f984ff78196507a9b54521160bdb24978d0757df70decb1f0",
+          "result": "0x0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "Numeric block tags; final provider header matched the previous capture. Not EIP-1898 or independent consensus proof.",
+    "Storage mapping is interpreted using canonical V4 layout and configured tick spacing. Runtime code identity remains a release gate.",
+    "Historical observations are not a live trading configuration."
+  ]
+}

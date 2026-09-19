@@ -1,0 +1,147 @@
+//go:build !wasm && linux
+
+// Optional observer for the pinned Nitro source revision. It does not alter
+// block execution, admission/filtering, consensus, or chain configuration.
+package gethexec
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"sync"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
+
+	nativebridge "github.com/offchainlabs/nitro/execution/nativebridge"
+)
+
+type nativeArbExportState struct {
+	once     sync.Once
+	manifest *nativebridge.Manifest
+	server   *nativebridge.Server
+}
+type nativeArbStateReader struct{ db *state.StateDB }
+
+func (r nativeArbStateReader) CodeHash(a nativebridge.Address) (nativebridge.Word, error) {
+	value := r.db.GetCodeHash(common.Address(a))
+	return nativebridge.Word(value), r.db.Error()
+}
+func (r nativeArbStateReader) Storage(a nativebridge.Address, w nativebridge.Word) (nativebridge.Word, error) {
+	value := r.db.GetState(common.Address(a), common.Hash(w))
+	return nativebridge.Word(value), r.db.Error()
+}
+func (r nativeArbStateReader) MappingSlot(key nativebridge.Word, base nativebridge.Word) nativebridge.Word {
+    return nativebridge.Word(crypto.Keccak256Hash(key[:], base[:]))
+}
+func (s *ExecutionEngine) nativeArbExportBlock(block *types.Block, receipts types.Receipts) {
+	x := &s.nativeArbExport
+	x.once.Do(func() {
+		filename := os.Getenv("NATIVE_EXPORT_CONFIG")
+		if filename == "" {
+			return
+		}
+		m, err := nativebridge.LoadManifestFile(filename)
+		if err == nil && s.bc.Config().ChainID.String() != "4663" {
+			err = fmt.Errorf("native exporter only supports configured chain 4663")
+		}
+		if err != nil {
+			log.Error("Native exporter disabled: invalid manifest", "err", err)
+			return
+		}
+		server, err := nativebridge.Listen(m)
+		if err != nil {
+			log.Error("Native exporter disabled: listener", "err", err)
+			return
+		}
+		x.manifest = m
+		x.server = server
+		log.Info("Native exporter active", "revision", nativebridge.Revision, "manifestHash", m.Source().ManifestHash)
+	})
+	if x.server == nil {
+		return
+	}
+	// appendBlock has completed its canonical write and still holds the execution
+	// lock. Reopen THIS root locally; never read whichever head happens to be latest.
+	fail := func(err error) {
+		x.server.Close()
+		x.server = nil
+		log.Error("Native exporter halted; operator recovery required", "err", err)
+	}
+	db, err := s.bc.StateAt(block.Root())
+	if err != nil {
+		fail(err)
+		return
+	}
+	sequence, err := s.BlockNumberToMessageIndex(block.NumberU64())
+	if err != nil {
+		fail(err)
+		return
+	}
+	exported, err := s.nativeArbExportReceipts(block, receipts)
+	if err != nil {
+		fail(err)
+		return
+	}
+	head := nativebridge.Head{Sequence: uint64(sequence), Number: block.NumberU64(), Timestamp: block.Time(), Hash: nativebridge.Word(block.Hash()), ParentHash: nativebridge.Word(block.ParentHash()), StateRoot: nativebridge.Word(block.Root())}
+	if err = x.server.Commit(head, nativeArbStateReader{db}, exported); err != nil {
+		fail(err)
+	}
+}
+func (s *ExecutionEngine) nativeArbExportInvalidate(from uint64) {
+	if s.nativeArbExport.server != nil {
+		s.nativeArbExport.server.Invalidate(from, "Nitro canonical reorg")
+	}
+}
+func (s *ExecutionEngine) nativeArbExportReceipts(block *types.Block, receipts types.Receipts) ([]nativebridge.Receipt, error) {
+	txs := block.Transactions()
+	if len(txs) != len(receipts) {
+		return nil, fmt.Errorf("transaction/receipt count mismatch")
+	}
+	relayer := common.Address(s.nativeArbExport.manifest.Relayer())
+	arbosVersion := types.DeserializeHeaderExtraInformation(block.Header()).ArbOSFormatVersion
+	signer := types.MakeSigner(s.bc.Config(), block.Number(), block.Time(), arbosVersion)
+	result := make([]nativebridge.Receipt, 0)
+	for i, tx := range txs {
+		// Inspect all ordinary signed transaction types for this dedicated EOA.
+		// Unexpected nonce use is an operational error, not an ignored receipt.
+		switch tx.Type() {
+		case types.LegacyTxType, types.AccessListTxType, types.DynamicFeeTxType, types.BlobTxType, types.SetCodeTxType:
+		default:
+			continue // Arbitrum system/delayed transactions are not this signer.
+		}
+		sender, err := types.Sender(signer, tx)
+		if err != nil {
+			return nil, err
+		}
+		if sender != relayer {
+			continue
+		}
+		if tx.Type() != types.DynamicFeeTxType {
+			return nil, fmt.Errorf("unexpected transaction type from dedicated relayer")
+		}
+		receipt := receipts[i]
+		if receipt == nil || receipt.TxHash != tx.Hash() || receipt.GasUsedForL1 > receipt.GasUsed || receipt.EffectiveGasPrice == nil || receipt.EffectiveGasPrice.Sign() <= 0 {
+			return nil, fmt.Errorf("incomplete executed receipt %s; no fee inference permitted", tx.Hash())
+		}
+		// Keep GasUsed inclusive. Do NOT add GasUsedForL1 a second time. Real-chain
+		// balance/receipt parity is still a release gate for this fee interpretation.
+		out := nativebridge.Receipt{TxHash: tx.Hash().Hex(), BlockNumber: block.Number().String(), BlockHash: block.Hash().Hex(), Nonce: strconv.FormatUint(tx.Nonce(), 10), Status: receipt.Status, FeeModel: s.nativeArbExport.manifest.FeeModel(), GasUsed: strconv.FormatUint(receipt.GasUsed, 10), EffectiveGasPrice: receipt.EffectiveGasPrice.String(), Logs: make([]nativebridge.Log, 0, len(receipt.Logs))}
+		for _, entry := range receipt.Logs {
+			if entry == nil {
+				return nil, fmt.Errorf("nil executed log")
+			}
+			topics := make([]string, len(entry.Topics))
+			for j, topic := range entry.Topics {
+				topics[j] = topic.Hex()
+			}
+			out.Logs = append(out.Logs, nativebridge.Log{Address: entry.Address.Hex(), Topics: topics, Data: hexutil.Encode(entry.Data), Removed: entry.Removed})
+		}
+		result = append(result, out)
+	}
+	return result, nil
+}

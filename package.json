@@ -31,7 +31,18 @@
     "legacy:monitor": "node arb.js --dry-run",
     "legacy:live": "node arb.js --live",
     "deploy:legacy": "node deploy.js",
-    "feed:edge": "python3.11 sequencer/rh_feed_edge.py"
+    "feed:edge": "python3.11 sequencer/rh_feed_edge.py",
+    "native:replay": "node native/runner.mjs --config native/example.json --replay native/example.ndjson",
+    "native:monitor": "node native/runner.mjs",
+    "test:native": "node --test test/native-*.test.mjs",
+    "native:validate": "node scripts/validate-native.mjs",
+    "native:validate:offline": "node scripts/validate-native.mjs --offline",
+    "native:benchmark": "node native/benchmark.mjs",
+    "native:audit": "node native/audit.mjs",
+    "native:metrics": "node native/metrics.mjs",
+    "test:evm": "forge test -vv",
+    "native:test:exporter": "go -C native/nitro-exporter test -race -count=1 ./...",
+    "native:test:bridge": "node scripts/test-nitro-bridge.mjs"
   },
   "dependencies": {
     "dotenv": "17.4.2",
