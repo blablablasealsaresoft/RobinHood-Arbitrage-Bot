@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "type": "module",
   "private": true,
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "description": "Atomic arbitrage bot: RobinFun bonding curve <-> Uniswap V4 on Robinhood Chain",
   "scripts": {
     "monitor": "node arb.js --dry-run",
@@ -23,7 +25,8 @@
     "withdraw": "node withdraw.js",
     "allow-pools": "node allow-pools.js",
     "pause": "node executor-admin.js pause",
-    "unpause": "node executor-admin.js unpause"
+    "unpause": "node executor-admin.js unpause",
+    "sequencer:smoke": "node scripts/sequencer-smoke.js"
   },
   "dependencies": {
     "dotenv": "17.4.2",
