@@ -156,8 +156,7 @@ interface ISequencerSwapAdapterV4 {
 ///      The engine binds each intent to (anchorBlock, anchorBlockHash), then races into the next block.
 ///      minProfit may be zero for aggressive positive-after-gas off-chain gating, but the route must
 ///      still preserve the full flash-loan principal or the whole transaction reverts.
-contract SequencerFlashArbExecutorV4 is EIP712, Ownable2Step, Pausable, ReentrancyGuard {
-    using SafeERC20 for IERC20;
+contract SequencerFlashArbExecutorV4 is SequencerAuthV4, EIP712LiteV4 {
 
     uint256 public constant ROBINHOOD_CHAIN_ID = 4663;
     IArbSysSequencerV4 private constant ARBSYS = IArbSysSequencerV4(address(0x64));
@@ -345,8 +344,7 @@ contract SequencerFlashArbExecutorV4 is EIP712, Ownable2Step, Pausable, Reentran
     }
 
     function setPaused(bool value) external onlyOwner {
-        if (value) _pause();
-        else _unpause();
+        _setPaused(value);
         emit PauseSet(value);
     }
 
