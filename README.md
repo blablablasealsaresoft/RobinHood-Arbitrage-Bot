@@ -1,297 +1,285 @@
-# RobinHood Arbitrage Bot
+# Robinhood Sequencer Flash Arb
 
-> Indonesian documentation: [README.id.md](README.id.md)
+One bot. One strategy.
 
-Atomic arbitrage between a configured RobinFun bonding-curve manager and Uniswap V4 on Robinhood Chain (`chainId 4663`). The bot quotes both directions:
+```text
+verified Robinhood sequencer block N
+        ↓
+local Nitro node reaches the exact same N / blockHash
+        ↓
+one batched q-grid for RobinFun ↔ Uniswap V4
+        ↓
+choose highest positive expected-value q*
+        ↓
+sign EIP-712 intent anchored to L2 block N
+        ↓
+sign outer transaction once
+        ↓
+broadcast identical raw bytes through all measured paths
+        ↓
+L2 block N+1
+        ↓
+state locks
+        ↓
+Morpho WETH flash loan
+        ↓
+WETH → token → WETH
+        ↓
+repay principal
+        ↓
+incremental profit → treasury
+```
 
-| Direction | Route |
-|---|---|
-| A | buy on the curve, sell on V4 |
-| B | buy on V4, sell on the curve |
+This is intentionally **not** a general MEV framework, scanner, sandwich bot, directional trader, or inventory strategy.
 
-Live trading requires the deployed `ArbExecutor`. Both legs execute in one transaction. The executor reverts unless its ETH balance increases by the requested gross profit floor, which includes the bot's configured net target and bounded maximum gas cost. A reverted transaction still costs gas.
+## Why this architecture
 
-This software does not guarantee profit. It is designed to reject unprofitable or unsupported trades.
+Robinhood Chain is an Arbitrum/Nitro chain. The public sequencer feed gives a soft-confirmed L2 block before ordinary RPC consumers necessarily expose the executed state.
 
-## Supported market scope
+The bot uses that timing edge only to race an atomic arbitrage into the next L2 block.
 
-The scanner currently considers markets that satisfy all of these conditions:
+The feed is not treated as a pending Ethereum mempool. We do not attempt to insert before a transaction already sequenced.
 
-- The pool belongs to the configured Uniswap V4 PoolManager.
-- `currency0` is native ETH and `currency1` is the token.
-- The token has an active, non-graduated curve on the single RobinFun manager in `config.js`.
-- The pool has active liquidity according to V4 StateView.
-- The pool has no hooks.
-- Its fee and tick spacing pass validation.
+## Hot path
 
-The bot does not cover other RobinFun factory versions, hook-enabled pools, non-native pairs, or other DEXes. A market passing the scanner is only technically eligible. The trading loop still requires a positive quote after fees, conservative slippage, price impact, and bounded gas.
+`sequencer/rh_feed_edge.py`
 
-## Safety model
+- connects directly to the Robinhood mainnet sequencer feed
+- negotiates the required compression
+- uses the pinned `rhfeed` implementation
+- verifies every feed message against the mainnet sequencer signer
+- detects sequence/block-hash replacement events
+- emits compact NDJSON to the Node strategy process
 
-- Live mode is atomic-only. The unsafe two-transaction EOA path is disabled.
-- Every PoolKey requires an on-chain allowlist entry.
-- Newly discovered pools never receive permission automatically.
-- The executor enforces a maximum trade size and rejects hook-enabled pools.
-- The contract uses token balance deltas, safe ERC-20 calls, a reentrancy guard, two-step ownership transfer, and a pause switch.
-- The bot serializes scans and execution to prevent overlapping trades and nonce races.
-- Explicit gas and fee ceilings make the successful-trade profit floor conservative.
-- PM2 restarts failed processes, while transient RPC event errors are retried or ignored safely.
+`sequencer-bot.js`
 
-## Requirements
+- keeps a latest-only queue; stale work is discarded rather than queued
+- waits for `LOCAL_RPC_URL` to expose the exact feed block/hash
+- sends the complete q-grid as one JSON-RPC batch to `SequencerRouteQuoter`
+- evaluates both RobinFun→V4 and V4→RobinFun
+- chooses the candidate with the highest positive expected value
+- builds exact curve + V4 slot0 + V4 liquidity state locks
+- EIP-712 signs the V4 intent
+- reserves one relayer nonce
+- signs one EIP-1559 transaction
+- concurrently broadcasts the same raw bytes to every configured path
 
-- Node.js 20 or newer
-- npm
-- A dedicated wallet funded with Robinhood Chain ETH
-- A private Robinhood Chain RPC is recommended for live operation
-- PM2 for continuous operation
+There is no remote quote API in the execution path.
 
-Do not use a primary wallet. Never commit `.env`.
+## The Robinhood block-number trap
 
-## Install on Windows
+Robinhood inherits Arbitrum's split block-number semantics:
 
-```powershell
-npm install
-Copy-Item .env.example .env
+- RPC `eth_blockNumber` / sequencer sequence = L2 height
+- Solidity `block.number` = parent-chain estimate
+
+Therefore `SequencerFlashArbExecutorV4` **does not use `block.number` or the BLOCKHASH opcode for the sequencer anchor**.
+
+It uses the ArbSys precompile at `0x0000000000000000000000000000000000000064`:
+
+```solidity
+arbBlockNumber()
+arbBlockHash(anchorBlock)
+```
+
+With `maxAnchorDelay = 1`, an intent derived from L2 block N is executable only in L2 block N+1.
+
+## Execution contracts
+
+### `SequencerFlashArbExecutorV4.sol`
+
+- chain ID 4663 guard
+- EIP-712 strategy signer
+- separate relayer allowlist
+- owner / pending-owner administration
+- WETH borrow caps
+- adapter allowlist
+- nonce bitmap
+- ArbSys L2 block + block-hash anchoring
+- timestamp expiry
+- max gas-price check
+- mandatory signed state checks before Morpho
+- closed-loop routes only
+- per-leg minOut
+- exact Morpho principal approval
+- profit invariant before repayment
+- profit invariant after repayment
+- incremental profit transfer only
+- pause/rescue controls
+- no OpenZeppelin build dependency
+
+### `RobinFunWethAdapter.sol`
+
+Purpose-built WETH↔RobinFun conversion. It can only be called by the executor.
+
+### `UniswapV4WethAdapter.sol`
+
+Purpose-built WETH↔native-ETH V4 adapter.
+
+- executor-only swap entry
+- owner-allowlisted PoolKeys
+- hooks disabled
+- Permit2 approval warmed outside the hot path
+
+### `SequencerRouteQuoter.sol`
+
+Collapses each two-venue route quote into one `eth_call`, allowing the entire size/pool/direction grid to be sent in one local JSON-RPC batch.
+
+## Aggressive volume gate
+
+There is no fixed 150-bps hurdle.
+
+The strategy evaluates:
+
+```text
+P(win) × (gross route profit - successful gas)
+-
+P(lose race) × reverted-tx gas
+```
+
+and submits when expected value exceeds `MIN_EXPECTED_VALUE_WEI`.
+
+The default template starts with:
+
+```env
+LOSE_RACE_BPS=0
+MIN_EXPECTED_VALUE_WEI=0
+ONCHAIN_MIN_PROFIT_WEI=0
+```
+
+This means a route may be attempted with a very small edge, but it still must cover the modeled successful gas cost. As telemetry accumulates, set `LOSE_RACE_BPS` from measured race/revert frequency.
+
+`ONCHAIN_MIN_PROFIT_WEI=0` does **not** permit principal loss. The callback still has to end with the full borrowed WETH principal available for Morpho.
+
+## Install
+
+Node:
+
+```bash
+npm ci
 npm run check
 ```
 
-Fill at least these values in `.env`:
+Feed environment:
 
-```env
-PRIVATE_KEY=0x...
-EXECUTOR_ADDR=
-LIVE=0
-
-EXEC_RPC_URL=https://robinhood-mainnet.g.alchemy.com/v2/YOUR_KEY
-RPC_URL=
-
-WATCHLIST=1
-MIN_SIZE_ETH=0.002
-MAX_SIZE_ETH=0.005
-MIN_PROFIT_BPS=150
-SLIPPAGE_BPS=100
-GAS_UNITS=700000
-GAS_BUFFER_BPS=12000
+```bash
+python3.11 -m venv .venv
+. .venv/bin/activate
+pip install -r sequencer/requirements.txt
 ```
 
-RPC selection works as follows:
+Copy configuration:
 
-- Trading uses `EXEC_RPC_URL` when configured.
-- Monitoring uses `RPC_URL`, then falls back to `EXEC_RPC_URL`, then to the built-in pinned public provider.
-- Scheduled scanning uses `SCAN_RPC_URL`; when blank, it uses the pinned public provider so historical log reads do not consume the trading RPC quota.
+```bash
+cp .env.example .env
+```
 
-`RPC_URL` and `EXEC_RPC_URL` may point to the same private Alchemy endpoint.
+## Required infrastructure
 
-## Deploy the executor
+For live mode:
 
-Deployment is a one-time operation for each executor version:
+- dedicated relayer key
+- separate strategy-signing key
+- treasury
+- Safe/multisig owner
+- **local Robinhood Nitro RPC** at `LOCAL_RPC_URL`
+- at least one measured transaction-delivery path
+- Python 3.11+ feed process
 
-```powershell
-npm run build:contract
+The local node matters. The feed carries ordering/calldata but not receipts or state. The bot waits for the local node to re-execute the signed block and then reads exact state from that exact hash.
+
+## Build and deploy
+
+```bash
+npm run check
 npm run deploy
 ```
 
-Copy the printed contract address into `.env`:
+Deployment creates/configures:
 
-```env
-EXECUTOR_ADDR=0x...
-```
+1. `SequencerFlashArbExecutorV4`
+2. `RobinFunWethAdapter`
+3. `UniswapV4WethAdapter`
+4. `SequencerRouteQuoter`
 
-The deployment starts with no allowed pools. Existing deployments from the original RobinArb contract are not ABI-compatible with this hardened executor.
+It warms V4 approvals and pool permissions, allowlists both adapters, enables the relayer, sets the WETH borrow cap, and sets `maxAnchorDelay=1`.
 
-## Discover and review markets
+If `SAFE_OWNER` differs from the deployer, executor ownership is left pending for the Safe to accept after configuration.
 
-These commands are read-only on-chain:
+Do not start live mode until the chain-4663 Morpho fork suite passes.
 
-```powershell
-npm run scan
-npm run smoke
-npm run snapshot -- 0.002
-```
+## Run
 
-`scan` writes `watchlist.json` and an ignored incremental cache. A cold scan reads historical `Initialize` events once. Later scans read only a reorg overlap and new blocks.
+Dry:
 
-The scan summary distinguishes raw pool discovery from eligible markets. `Added: none` means no new pool passed every filter; raw V4 pools may still have been created.
-
-Review `watchlist.json` immediately before granting permissions. Then run:
-
-```powershell
-npm run allow-pools
-```
-
-This command sends on-chain transactions. It skips PoolKeys and tokens already approved, so rerunning it does not intentionally pay for duplicate permissions.
-
-After allowing a new pool, reload the trading process:
-
-```powershell
-pm2 restart robinarb --update-env
-pm2 save
-```
-
-Scanner removal does not revoke an existing on-chain permission. The bot stops loading removed pools after restart, but the executor permission remains until explicitly revoked at contract level.
-
-## Fund and withdraw
-
-Deposit `0.01 ETH`:
-
-```powershell
-$env:AMOUNT_ETH="0.01"
-npm run deposit
-Remove-Item Env:AMOUNT_ETH
-```
-
-Withdraw everything:
-
-```powershell
-npm run withdraw
-```
-
-Withdraw an exact amount:
-
-```powershell
-$env:AMOUNT_ETH="0.005"
-npm run withdraw
-Remove-Item Env:AMOUNT_ETH
-```
-
-The executor balance is working capital. `MAX_SIZE_ETH` remains the maximum size per trade.
-
-## Run the bot
-
-One-time dry run:
-
-```powershell
-npm run monitor:once
-```
-
-Continuous dry run:
-
-```powershell
+```bash
 npm run monitor
 ```
 
-Foreground live mode:
+Live:
 
-```powershell
-npm run live
+```bash
+LIVE=1 npm run live
 ```
 
-`npm run live` can submit transactions. It requires a funded, unpaused executor owned by `PRIVATE_KEY`, at least one allowlisted watchlist pool, and matching chain configuration.
+PM2:
 
-## PM2 operation
-
-`ecosystem.config.cjs` defines two processes:
-
-| Process | Responsibility |
-|---|---|
-| `robinarb` | quote markets and execute allowed atomic trades |
-| `robinarb-scanner` | run the incremental read-only scanner at startup and every 30 minutes |
-
-Start or reload both:
-
-```powershell
+```bash
 pm2 startOrReload ecosystem.config.cjs --update-env
 pm2 save
-pm2 status
 ```
 
-Logs:
+The PM2 configuration intentionally runs **one process / one strategy**.
 
-```powershell
-pm2 logs robinarb
-pm2 logs robinarb-scanner
-```
+## Telemetry
 
-PM2 reloads `.env` only when the process restarts. Set `LIVE=1`, then run `pm2 restart robinarb --update-env` to enable live mode. On Windows, `pm2 save` stores the process list; use `pm2 resurrect` after reboot unless a separate Windows startup task has been configured.
+`SEQUENCER_TELEMETRY` is NDJSON and records:
 
-Emergency stop:
+- anchor block/hash
+- feed→local-node catch-up latency
+- q-grid quote latency
+- chosen direction/pool/size
+- modeled gross profit
+- expected value
+- intent-build latency
+- tx nonce/hash
+- per-broadcast-path latency
+- skipped/replaced anchors
+- broadcast failures
 
-```powershell
-npm run pause
-pm2 stop robinarb
-```
+Use this data to tune:
 
-Resume after review:
+- `LOSE_RACE_BPS`
+- local-node catch-up budget
+- q-grid size
+- gas model
+- broadcast path selection
 
-```powershell
-npm run unpause
-pm2 restart robinarb --update-env
-```
+Do not optimize from anecdotes; optimize from inclusion and realized-P&L measurements.
 
-## Telegram alerts
+## Validation gate
 
-Set:
+`npm run check` now:
 
-```env
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-TELEGRAM_POLL_ALERTS=1
-TELEGRAM_SCAN_ALERTS=1
-```
+1. syntax-checks root, scripts, tests, and sequencer modules
+2. runs unit tests
+3. compiles every Solidity source under `contracts/` with solc 0.8.26
 
-The bot reports startup, each configured poll, idle and negative spreads, eligible opportunities, successful trades, execution errors, scheduled scan summaries, added and removed markets, scanner failures, pool permissions, deposits, withdrawals, pause, and unpause.
+Production still requires a Robinhood mainnet-fork suite proving:
 
-Polling alerts can be noisy. Set `TELEGRAM_POLL_ALERTS=0` to disable them without disabling trade and scanner alerts. Telegram requests have a timeout and never block trading permanently.
+- ArbSys block anchor parity with feed sequence/hash
+- wrong/replaced anchor reverts
+- stale curve/V4 state reverts before borrowing
+- Morpho flash callback/repayment succeeds
+- losing route reverts atomically
+- `minProfit=0` still preserves principal
+- positive minProfit is enforced
+- both adapters settle exactly back to WETH
+- Permit2/router permissions cannot route arbitrary assets/pools
+- only incremental profit reaches treasury
 
-## Main configuration
+## Legacy files
 
-| Variable | Purpose |
-|---|---|
-| `LIVE` | `1` enables live trading for PM2; `npm run live` forces live and monitor commands force dry-run |
-| `WATCHLIST` | load supported markets from `watchlist.json` |
-| `MIN_SIZE_ETH`, `MAX_SIZE_ETH` | geometric probe boundaries and per-trade size range |
-| `GRID_POINTS` | number of geometric probe sizes per direction |
-| `MIN_PROFIT_BPS` | required net profit after the bounded gas reserve |
-| `SLIPPAGE_BPS` | conservative first-leg token floor |
-| `GAS_UNITS` | hard transaction gas limit and profit-reserve basis |
-| `GAS_BUFFER_BPS` | fee-per-gas ceiling buffer; `12000` means 20% |
-| `POLL_MS` | fallback market polling interval |
-| `EVENT_POLL_MS` | provider log polling cadence |
-| `RPC_URL`, `EXEC_RPC_URL` | monitoring and execution RPC endpoints |
-| `SCAN_RPC_URL` | optional scanner-specific RPC |
-| `SCAN_INTERVAL_MS` | PM2 scanner interval; default `1800000` (30 minutes) |
-| `SCAN_RETRY_MS` | retry delay after a failed scheduled scan |
-| `SCAN_CONFIRMATIONS` | blocks excluded from the scanner head for finality |
-| `SCAN_REORG_OVERLAP` | blocks re-read to replace a reorged cache tail |
-| `RPC_CONCURRENCY`, `RPC_RETRIES` | limits for the pinned public provider |
+The repository retains the earlier `arb.js`, scanner, funded `ArbExecutor.sol`, and related scripts for comparison/history.
 
-`GAS_UNITS=700000` is a ceiling, not the amount always charged. The transaction receipt charges actual gas used. The bot nevertheless reserves the full configured ceiling when deciding whether a trade meets the profit threshold, which may reject thin opportunities.
-
-## Validation commands
-
-```powershell
-npm test
-npm run check
-npm run smoke
-npm audit
-```
-
-`npm run check` runs syntax validation, seven automated tests, and deterministic Solidity compilation with `solc 0.8.26`.
-
-## Repository layout
-
-| Path | Purpose |
-|---|---|
-| `arb.js` | market quoting, event handling, serialized live execution |
-| `risk.js` | configuration validation, gas policy, grid sizing, serialization |
-| `scanner.js` | incremental on-chain market discovery and watchlist generation |
-| `scanner-daemon.js` | scheduled scanner process used by PM2 |
-| `scripts/smoke.js` | read-only chain, bytecode, liquidity, and quote checks |
-| `allow-pools.js` | idempotent on-chain PoolKey and token permissions |
-| `executor-admin.js` | pause and unpause operations |
-| `provider.js` | private RPC selection and pinned-provider retry logic |
-| `telegram.js` | non-blocking operational and trade alerts |
-| `contracts/ArbExecutor.sol` | atomic executor and on-chain risk controls |
-| `deploy.js`, `deposit.js`, `withdraw.js` | executor lifecycle and funds |
-| `test/` | contract compile, PoolKey, risk, and scanner-output tests |
-
-## Known limitations
-
-- The configured RobinFun manager is the only supported curve venue.
-- The bot does not support hook-enabled pools or non-native V4 pairs.
-- A successful trade must satisfy the configured net floor, but reverted attempts, deployment, permissions, and admin operations still cost gas.
-- There is no persistent P&L database or daily gas-loss circuit breaker yet.
-- The contracts have not received an independent security audit.
-- Competition, transaction ordering, liquidity changes, and RPC latency can eliminate a quoted opportunity before inclusion.
-
-Use a dedicated wallet, start with limited capital, and review on-chain receipts rather than treating uptime or scanner activity as evidence of profit.
+They are **not the primary production strategy**. `npm run live`, `npm run monitor`, PM2, and `npm run deploy` now target the sequencer-flash architecture.
