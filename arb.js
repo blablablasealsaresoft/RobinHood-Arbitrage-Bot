@@ -56,6 +56,7 @@ const CFG = {
   once: process.argv.includes('--once'),
   sequencerFeed: process.env.SEQUENCER_FEED === '1',
   sequencerTriggerMinMs: envInteger('SEQUENCER_TRIGGER_MIN_MS', 500, { min: 0, max: 60000 }),
+  sequencerLiveMaxAgeMs: envInteger('SEQUENCER_LIVE_MAX_AGE_MS', 5000, { min: 100, max: 60000 }),
   sequencerFilterMode: process.env.SEQUENCER_FILTER_MODE || 'targets',
 };
 if (CFG.minSize <= 0n || CFG.maxSize < CFG.minSize) throw new Error('invalid MIN_SIZE_ETH/MAX_SIZE_ETH');
@@ -273,6 +274,7 @@ async function main() {
   let lastSequencerTriggerAt = 0;
   if (CFG.sequencerFeed && !CFG.once) {
     sequencerFeed = new SequencerFeedClient({
+      maxLiveAgeMs: CFG.sequencerLiveMaxAgeMs,
       onBatch: (batch) => {
         const matched = batch.transactions.filter((tx) => tx.to && sequencerTargets.has(tx.to.toLowerCase()));
         latency.record('feed', {
