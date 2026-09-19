@@ -25,6 +25,7 @@ import { CURVE, V4, TOKEN, POOLS } from './config.js';
 import { notifyStartup, notifyAtomic, notifyError, notifyPoll, notifyNoMarkets, tg, tgEnabled } from './telegram.js';
 import { bpsDown, buildGrid, envInteger, feeOverrides, serialRunner } from './risk.js';
 import { SequencerFeedClient } from './sequencer-feed.js';
+import { createLatencyRecorder } from './latency.js';
 
 const EXECUTOR_ABI = [
   'function curveToV4(address token,uint256 ethIn,uint256 minTokensOut,(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks) key,uint128 minEthOut,uint256 minProfit)',
@@ -149,6 +150,7 @@ async function main() {
   }
 
   let gasPolicy = feeOverrides(await execProvider.getFeeData(), CFG.gasUnits, CFG.gasBufferBps);
+  const latency = createLatencyRecorder();
 
   console.log(`\nRobinFun<->UniV4 arb | ${CFG.live ? 'LIVE' : 'DRY-RUN'} | ${executor ? 'ATOMIC' : 'MONITOR'} | ${CFG.watchlist ? 'WATCHLIST' : 'single'}`);
   console.log(`wallet: ${wallet ? wallet.address : '(monitor only)'}`);
@@ -210,6 +212,7 @@ async function main() {
 
   let lastLog = 0;
   async function tickBody(trigger = 'poll') {
+    const tickStartedAt = Date.now();
     gasPolicy = feeOverrides(await execProvider.getFeeData(), CFG.gasUnits, CFG.gasBufferBps);
     const all = await scanAll();
     if (!all.length) {
@@ -218,12 +221,14 @@ async function main() {
     }
     const b = all[0];
     const bps = b.size > 0n ? (b.net * 10000n) / b.size : 0n;
+    if (trigger === 'sequencer') latency.record('scan', { scanMs: Date.now() - tickStartedAt, symbol: b.market.symbol, direction: b.dir, bps: bps.toString() });
     const line = `${new Date().toISOString()} [${trigger}] best=${b.market.symbol} ${b.tag}@${b.pool?.name} size=${formatEther(b.size)} net=${formatEther(b.net)} (${bps} bps)`;
     if (trigger === 'poll' || trigger === 'boot') {
       notifyPoll({ trigger, symbol: b.market.symbol, route: b.tag, pool: b.pool?.name,
         size: b.size, net: b.net, bps, gateBps: CFG.minProfitBps }).catch(() => {});
     }
     if (bps >= CFG.minProfitBps) {
+      latency.record('opportunity', { trigger, symbol: b.market.symbol, direction: b.dir, bps: bps.toString(), netWei: b.net.toString(), sizeWei: b.size.toString(), scanMs: Date.now() - tickStartedAt });
       console.log('>>> OPPORTUNITY', line);
       if (!CFG.live || !wallet) { console.log('    (idle: dry-run/no wallet)'); return; }
       try {
@@ -261,12 +266,14 @@ async function main() {
   if (CFG.sequencerFeed && !CFG.once) {
     sequencerFeed = new SequencerFeedClient({
       onBatch: (batch) => {
+        latency.record('feed', { sequenceNumber: batch.lastSequenceNumber, messageCount: batch.messageCount, frameBytes: batch.frameBytes });
         const now = Date.now();
         if (now - lastSequencerTriggerAt < CFG.sequencerTriggerMinMs) return;
         lastSequencerTriggerAt = now;
         tick('sequencer').catch((e) => console.error('sequencer tick:', e));
       },
       onStatus: (status) => {
+        latency.record('feed-status', { type: status.type, error: status.error || null });
         if (status.type === 'connected') console.log('sequencer feed: connected');
         else if (status.type === 'disconnected') console.log('sequencer feed: disconnected; reconnecting');
         else if (status.type === 'error') console.warn('sequencer feed:', status.error);
