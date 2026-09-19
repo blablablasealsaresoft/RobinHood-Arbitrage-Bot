@@ -7,6 +7,11 @@ interface IERC20FlashV4 {
     function transfer(address to, uint256 amount) external returns (bool);
 }
 
+interface IArbSysV4 {
+    function arbBlockNumber() external view returns (uint256);
+    function arbBlockHash(uint256 arbBlockNum) external view returns (bytes32);
+}
+
 interface IMorphoBlueV4 {
     function flashLoan(address token, uint256 assets, bytes calldata data) external;
 }
@@ -24,6 +29,7 @@ interface ISwapAdapterV4 {
 ///      longer canonical, if the relevant state moved, if any swap misses its
 ///      floor, or if final profit is below minProfit, the whole tx reverts.
 contract SequencerFlashArbExecutorV4 {
+    IArbSysV4 private constant ARBSYS = IArbSysV4(address(0x64));
     bytes32 private constant EIP712_DOMAIN_TYPEHASH =
         keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
     bytes32 private constant INTENT_TYPEHASH = keccak256(
@@ -205,15 +211,16 @@ contract SequencerFlashArbExecutorV4 {
         require(phase == 0, "busy");
         require(relayers[msg.sender], "relayer not allowed");
         require(intent.settlementToken != address(0), "zero settlement");
-        require(intent.borrowAmount > 0 && intent.minProfit > 0, "zero economics");
+        require(intent.borrowAmount > 0, "zero borrow");
         require(intent.maxGasPrice > 0 && tx.gasprice <= intent.maxGasPrice, "gas price");
 
-        require(intent.anchorBlock < block.number, "anchor not previous");
-        require(block.number <= uint256(intent.anchorBlock) + maxAnchorDelay, "anchor stale");
-        require(blockhash(intent.anchorBlock) == intent.anchorBlockHash, "anchor hash");
+        uint256 l2Block = ARBSYS.arbBlockNumber();
+        require(intent.anchorBlock < l2Block, "anchor not previous");
+        require(l2Block <= uint256(intent.anchorBlock) + maxAnchorDelay, "anchor stale");
+        require(ARBSYS.arbBlockHash(intent.anchorBlock) == intent.anchorBlockHash, "anchor hash");
         require(intent.validAfterBlock > intent.anchorBlock, "window before anchor");
-        require(block.number >= intent.validAfterBlock, "too early");
-        require(block.number <= intent.validUntilBlock, "too late");
+        require(l2Block >= intent.validAfterBlock, "too early");
+        require(l2Block <= intent.validUntilBlock, "too late");
         require(intent.validUntilBlock >= intent.validAfterBlock, "bad blocks");
         require(intent.validUntilBlock - intent.validAfterBlock <= maxBlockWindow, "window too wide");
         require(block.timestamp <= intent.deadline, "expired");
