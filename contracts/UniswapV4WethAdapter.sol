@@ -118,6 +118,7 @@ contract UniswapV4WethAdapter {
         bytes calldata data
     ) external onlyExecutor nonReentrant returns (uint256 amountOut) {
         require(amountIn > 0 && minAmountOut > 0, "bad amount");
+        require(amountIn <= type(uint128).max && minAmountOut <= type(uint128).max, "uint128 overflow");
         PoolKey memory key = abi.decode(data, (PoolKey));
         if (!allowedPool[poolId(key)]) revert PoolNotAllowed();
         if (key.currency0 != NATIVE || key.hooks != address(0)) revert PoolNotAllowed();
