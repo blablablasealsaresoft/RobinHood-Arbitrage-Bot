@@ -5,6 +5,8 @@ let firstAt = null;
 let lastAt = null;
 let frames = 0;
 let messages = 0;
+let liveFrames = 0;
+let transactions = 0;
 
 const client = new SequencerFeedClient({
   onBatch: (batch) => {
@@ -12,6 +14,8 @@ const client = new SequencerFeedClient({
     lastAt = batch.receivedAt;
     frames++;
     messages += batch.messageCount;
+    transactions += batch.transactions.length;
+    if (batch.live) liveFrames++;
     if (frames <= 5) {
       console.log(JSON.stringify({
         feed: 'batch',
@@ -19,6 +23,16 @@ const client = new SequencerFeedClient({
         messageCount: batch.messageCount,
         frameBytes: batch.frameBytes,
         receivedAt: batch.receivedAt,
+        live: batch.live,
+        messageAgeMs: batch.messageAgeMs,
+        transactionCount: batch.transactions.length,
+        transactions: batch.transactions.slice(0, 5).map((tx) => ({
+          sequenceNumber: tx.sequenceNumber,
+          to: tx.to,
+          selector: tx.selector,
+          valueWei: tx.valueWei,
+          txType: tx.txType,
+        })),
       }));
     }
   },
@@ -41,6 +55,8 @@ setTimeout(() => {
     durationMs,
     frames,
     messages,
+    liveFrames,
+    transactions,
     framesPerSecond: Number((frames * 1000 / elapsedMs).toFixed(2)),
     messagesPerSecond: Number((messages * 1000 / elapsedMs).toFixed(2)),
     stats: client.snapshot(),
