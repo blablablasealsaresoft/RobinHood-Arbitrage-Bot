@@ -36,6 +36,7 @@ contract SequencerRouteQuoter {
         IV4Quote.PoolKey calldata key
     ) external returns (uint256 tokenOut,uint256 wethOut,uint256 v4GasEstimate) {
         tokenOut = curve.quoteBuy(token, wethIn);
+        require(tokenOut <= type(uint128).max, "quote overflow");
         (wethOut, v4GasEstimate) = v4Quoter.quoteExactInputSingle(
             IV4Quote.QuoteExactSingleParams({
                 poolKey: key,
