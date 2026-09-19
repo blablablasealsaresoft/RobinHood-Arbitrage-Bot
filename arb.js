@@ -77,6 +77,9 @@ const CFG = {
   flashBlockWindow: envInteger('FLASH_BLOCK_WINDOW', 1, { min: 1, max: 16 }),
   flashDeadlineSeconds: envInteger('FLASH_DEADLINE_SECONDS', 5, { min: 1, max: 60 }),
   sequencerMaxBlockLag: envInteger('SEQUENCER_MAX_BLOCK_LAG', 8, { min: 0, max: 1000 }),
+  submitRpcUrl: process.env.SUBMIT_RPC_URL || (process.env.DIRECT_SEQUENCER_SUBMIT === '1'
+    ? 'https://sequencer.mainnet.chain.robinhood.com'
+    : null),
 };
 if (CFG.minSize <= 0n || CFG.maxSize < CFG.minSize) throw new Error('invalid MIN_SIZE_ETH/MAX_SIZE_ETH');
 if (!['targets','all'].includes(CFG.sequencerFilterMode)) throw new Error('SEQUENCER_FILTER_MODE must be targets or all');
@@ -149,6 +152,13 @@ async function main() {
     execProvider = new JsonRpcProvider(process.env.EXEC_RPC_URL, enet, { staticNetwork: enet });
     execWallet = new Wallet(process.env.PRIVATE_KEY, execProvider);
     console.log('exec RPC: dedicated');
+  }
+
+  let submitProvider = null;
+  if (CFG.submitRpcUrl && wallet) {
+    const enet = new Network('robinhood', 4663);
+    submitProvider = new JsonRpcProvider(CFG.submitRpcUrl, enet, { staticNetwork: enet });
+    console.log('submit RPC:', process.env.DIRECT_SEQUENCER_SUBMIT === '1' ? 'direct sequencer' : 'dedicated');
   }
 
   let markets = validateMarkets(loadMarkets());
@@ -325,25 +335,40 @@ async function main() {
     });
 
     const submitAt = Date.now();
-    const tx = await flashExecutor.executeFlashArb(intent, legs, checks, signature, b.txOverrides);
+    let txHash;
+    let receipt;
+    if (submitProvider) {
+      const request = await flashExecutor.executeFlashArb.populateTransaction(
+        intent, legs, checks, signature, b.txOverrides,
+      );
+      request.nonce = await execProvider.getTransactionCount(execWallet.address, 'pending');
+      request.chainId = 4663;
+      const raw = await execWallet.signTransaction(request);
+      txHash = await submitProvider.send('eth_sendRawTransaction', [raw]);
+      receipt = await execProvider.waitForTransaction(txHash);
+    } else {
+      const tx = await flashExecutor.executeFlashArb(intent, legs, checks, signature, b.txOverrides);
+      txHash = tx.hash;
+      receipt = await tx.wait();
+    }
     latency.record('flash-submitted', {
       triggerTxHash: sequencerContext.triggerTxHash,
       targetBlock: targetBlock.toString(),
       stateBlock: head.toString(),
       symbol: b.market.symbol,
       direction: b.dir,
-      txHash: tx.hash,
+      txHash,
+      directSequencer: Boolean(submitProvider),
       feedToSubmitMs: sequencerContext.receivedAt ? submitAt - sequencerContext.receivedAt : null,
       borrowWei: b.size.toString(),
       minProfitWei: minProfit.toString(),
     });
-    const receipt = await tx.wait();
     latency.record('flash-confirmed', {
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber,
       submitToConfirmMs: Date.now() - submitAt,
     });
-    console.log('  flash tx', receipt.hash);
+    console.log('  flash tx', receipt.hash || txHash);
     notifyAtomic({
       symbol: b.market.symbol,
       dir: b.dir,
@@ -545,6 +570,7 @@ async function main() {
     provider.removeAllListeners();
     provider.destroy();
     if (execProvider !== provider) execProvider.destroy();
+    submitProvider?.destroy();
     return;
   }
   const pollTimer = setInterval(() => tick('poll').catch(e => console.error('tick:', e)), CFG.pollMs);
@@ -555,6 +581,7 @@ async function main() {
     provider.removeAllListeners();
     provider.destroy();
     if (execProvider !== provider) execProvider.destroy();
+    submitProvider?.destroy();
     process.exit(0);
   });
 }
