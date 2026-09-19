@@ -233,6 +233,7 @@ contract SequencerFlashArbExecutorV3 {
         uint256 cap = borrowCaps[intent.settlementToken];
         require(cap > 0 && intent.borrowAmount <= cap, "borrow disabled/capped");
         require(legs.length >= 2, "route too short");
+        require(checks.length > 0, "no state checks");
         require(intent.routeHash == hashLegs(legs), "route hash");
         require(intent.stateChecksHash == hashStateChecks(checks), "checks hash");
 
@@ -259,6 +260,7 @@ contract SequencerFlashArbExecutorV3 {
         );
 
         require(phase == 1, "callback phase");
+        _forceApprove(intent.settlementToken, address(morpho), 0);
         uint256 afterRepay = IERC20Flash(intent.settlementToken).balanceOf(address(this));
         require(afterRepay >= baseline + intent.minProfit, "post-repay profit");
 
