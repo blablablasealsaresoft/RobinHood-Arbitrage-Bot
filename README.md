@@ -82,6 +82,30 @@ RPC selection works as follows:
 
 `RPC_URL` and `EXEC_RPC_URL` may point to the same private Alchemy endpoint.
 
+## Sequencer fast path
+
+Robinhood Chain publishes a Nitro sequencer feed at `wss://feed.mainnet.chain.robinhood.com`. When `SEQUENCER_FEED=1`, the bot uses incoming sequencer batches as an additional low-latency trigger for the existing atomic arb scan. The feed does **not** enable live trading and does not bypass the executor's profit/risk checks.
+
+Validate feed connectivity without a wallet:
+
+```powershell
+npm run sequencer:smoke
+```
+
+Recommended staged setup:
+
+```env
+SEQUENCER_FEED=1
+SEQUENCER_TRIGGER_MIN_MS=500
+FAST_RPC_URL=
+LATENCY_LOG=./logs/sequencer-latency.jsonl
+```
+
+`FAST_RPC_URL` is optional. For the lowest state latency, run a local Robinhood Nitro node with `--node.feed.input.url=wss://feed.mainnet.chain.robinhood.com` and point `FAST_RPC_URL` at that node. Without it, sequencer batches still trigger scans, but the ordinary RPC can lag behind the feed and return pre-batch state.
+
+The fast path remains serialized through the existing `serialRunner`; a burst of sequencer messages coalesces rather than launching overlapping nonce/execution work. `SEQUENCER_TRIGGER_MIN_MS` bounds quote load. Feed, scan, and opportunity timing is written as JSONL to `LATENCY_LOG`.
+
+
 ## Deploy the executor
 
 Deployment is a one-time operation for each executor version:
@@ -248,6 +272,10 @@ Polling alerts can be noisy. Set `TELEGRAM_POLL_ALERTS=0` to disable them withou
 | `POLL_MS` | fallback market polling interval |
 | `EVENT_POLL_MS` | provider log polling cadence |
 | `RPC_URL`, `EXEC_RPC_URL` | monitoring and execution RPC endpoints |
+| `FAST_RPC_URL` | optional local/low-latency state RPC used before `RPC_URL` |
+| `SEQUENCER_FEED`, `SEQUENCER_FEED_URL` | enable/configure Nitro sequencer feed triggers |
+| `SEQUENCER_TRIGGER_MIN_MS` | minimum interval between feed-triggered arb scans |
+| `LATENCY_LOG` | JSONL output for feed/scan/opportunity timing |
 | `SCAN_RPC_URL` | optional scanner-specific RPC |
 | `SCAN_INTERVAL_MS` | PM2 scanner interval; default `1800000` (30 minutes) |
 | `SCAN_RETRY_MS` | retry delay after a failed scheduled scan |
@@ -272,7 +300,9 @@ npm audit
 
 | Path | Purpose |
 |---|---|
-| `arb.js` | market quoting, event handling, serialized live execution |
+| `arb.js` | market quoting, sequencer/event triggering, serialized live execution |
+| `sequencer-feed.js` | reconnecting Nitro sequencer feed client |
+| `latency.js` | JSONL fast-path latency recorder |
 | `risk.js` | configuration validation, gas policy, grid sizing, serialization |
 | `scanner.js` | incremental on-chain market discovery and watchlist generation |
 | `scanner-daemon.js` | scheduled scanner process used by PM2 |
