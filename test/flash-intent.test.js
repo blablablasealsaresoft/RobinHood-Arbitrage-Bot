@@ -44,6 +44,8 @@ test('flash intent hashes route/state and recovers EIP-712 strategy signer', asy
     borrowAmount: 100n,
     minProfit: 5n,
     maxGasPrice: 1_000_000_000n,
+    anchorBlock: 999n,
+    anchorBlockHash: '0x' + '66'.repeat(32),
     validAfterBlock: 1000n,
     validUntilBlock: 1001n,
     deadline: 2_000_000_000n,
