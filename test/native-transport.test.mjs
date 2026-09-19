@@ -40,8 +40,8 @@ test('telemetry queue is bounded and final flush is awaited',async()=>{
   assert.equal(records.length,2);assert.equal(t.dropped,1);assert.ok(BigInt(records[0].monotonicNs)>0n);fs.rmSync(dir,{recursive:true});
 });
 test('relayer lock excludes a second writer; dirty history survives clean exit',()=>{
-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'arb-nonce-'));const relayer='0x'+'1'.repeat(40);
+  const parent=fs.mkdtempSync(path.join(os.tmpdir(),'arb-nonce-'));const dir=path.join(parent,'rt');const relayer='0x'+'1'.repeat(40);
   const a=new RelayerJournal(dir,relayer);assert.throws(()=>new RelayerJournal(dir,relayer));
   a.append({nonce:3n,txHash:H});a.close();assert.throws(()=>new RelayerJournal(dir,relayer));
-  assert.match(fs.readFileSync(path.join(dir,`${relayer}.ndjson`),'utf8'),/"nonce":"3"/);fs.rmSync(dir,{recursive:true});
+  assert.match(fs.readFileSync(path.join(dir,`${relayer}.ndjson`),'utf8'),/"nonce":"3"/);fs.rmSync(parent,{recursive:true});
 });

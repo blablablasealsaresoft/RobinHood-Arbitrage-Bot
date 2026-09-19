@@ -4,8 +4,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { RouteBook } from '../native/core.mjs';
 import { NITRO_REVISION, validateExecutionManifest, loadExecutionManifest, assertExecutionSocket } from '../native/execution-provenance.mjs';
+import { applyOwnedPrivate } from '../native/fs-privacy.mjs';
 const a = n => '0x' + n.toString(16).padStart(40, '0');
 const h = n => '0x' + n.toString(16).padStart(64, '0');
 function fixture() {
@@ -69,12 +71,20 @@ test('reorg resets unpaired cost frames and zero/missing state roots are rejecte
   guard.check({ type: 'invalidate', executionSource: guard.source });
   guard.check(costs(guard)); assert.throws(() => guard.check({ ...block(guard), stateRoot: h(0) }), /nonzero/);
 });
+function makeWorldReadable(target, posixMode) {
+  if (process.platform === 'win32') {
+    execFileSync('icacls', [target, '/grant', 'Everyone:(R)'], { encoding: 'utf8', windowsHide: true });
+  } else {
+    fs.chmodSync(target, posixMode);
+  }
+}
+
 test('live manifest loader requires owned 0600 regular file', () => {
   const f = fixture(), dir = fs.mkdtempSync(path.join(os.tmpdir(), 'manifest-'));
   try {
     f.config.executionManifest = path.join(dir, 'manifest.json'); fs.writeFileSync(f.config.executionManifest, f.approve(), { mode: 0o644 });
     assert.throws(() => loadExecutionManifest(f.config, f.book), /0600/);
-    fs.chmodSync(f.config.executionManifest, 0o600); assert.ok(loadExecutionManifest(f.config, f.book));
+    applyOwnedPrivate(f.config.executionManifest, { kind: 'file' }); assert.ok(loadExecutionManifest(f.config, f.book));
     const link = path.join(dir, 'link'); fs.symlinkSync(f.config.executionManifest, link); f.config.executionManifest = link;
     assert.throws(() => loadExecutionManifest(f.config, f.book), /0600/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -82,9 +92,9 @@ test('live manifest loader requires owned 0600 regular file', () => {
 test('live socket is bound to reviewed path and owned private directory', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-socket-')), sock = path.join(dir, 'export.sock');
   try {
-    fs.chmodSync(dir, 0o700); assertExecutionSocket(sock, sock);
+    applyOwnedPrivate(dir, { kind: 'directory' }); assertExecutionSocket(sock, sock);
     assert.throws(() => assertExecutionSocket(sock, sock + 'x'), /differs/);
-    fs.chmodSync(dir, 0o755); assert.throws(() => assertExecutionSocket(sock, sock), /0700/);
+    makeWorldReadable(dir, 0o755); assert.throws(() => assertExecutionSocket(sock, sock), /0700/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

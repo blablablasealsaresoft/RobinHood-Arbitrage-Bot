@@ -3,6 +3,38 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import solc from 'solc';
 
+test('SequencerFlashArbExecutorV4 compiles bytecode with repository paris/optimizer settings and via_ir disabled', () => {
+  const source = fs.readFileSync(new URL('../contracts/SequencerFlashArbExecutorV4.sol', import.meta.url), 'utf8');
+  const foundry = fs.readFileSync(new URL('../foundry.toml', import.meta.url), 'utf8');
+  assert.match(foundry, /via_ir\s*=\s*false/);
+  const output = JSON.parse(solc.compile(JSON.stringify({
+    language: 'Solidity',
+    sources: { 'SequencerFlashArbExecutorV4.sol': { content: source } },
+    settings: {
+      evmVersion: 'paris',
+      optimizer: { enabled: true, runs: 500 },
+      viaIR: false,
+      metadata: { bytecodeHash: 'none' },
+      outputSelection: { '*': { '*': ['abi', 'evm.bytecode.object'] } },
+    },
+  })));
+  const errors = (output.errors || []).filter((e) => e.severity === 'error');
+  assert.deepEqual(errors, []);
+  const artifact = output.contracts['SequencerFlashArbExecutorV4.sol'].SequencerFlashArbExecutorV4;
+  assert.ok(artifact.evm.bytecode.object.length > 0);
+  const names = new Set(artifact.abi.filter((x) => x.type === 'function').map((x) => x.name));
+  for (const name of [
+    'executeFlashArb',
+    'onMorphoFlashLoan',
+    'hashIntent',
+    'hashLegs',
+    'hashStateChecks',
+    'domainSeparator',
+  ]) {
+    assert.ok(names.has(name), `missing ${name}`);
+  }
+});
+
 test('SequencerFlashArbExecutorV3 compiles and exposes signed flash-arb safety controls', () => {
   const source = fs.readFileSync(new URL('../contracts/SequencerFlashArbExecutorV3.sol', import.meta.url), 'utf8');
   const input = {

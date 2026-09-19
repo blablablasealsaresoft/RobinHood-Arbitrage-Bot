@@ -65,7 +65,8 @@ class InstallerTests(unittest.TestCase):
             root = Path(directory)
             target = root / installer.SOURCE
             target.parent.mkdir(parents=True)
-            target.write_text(FIXTURE)
+            target.write_bytes(FIXTURE.encode())
+            self.assertNotIn(b"\r\n", target.read_bytes())
             answers = [installer.REVISION, "", installer.GETH_REVISION, ""]
             with patch.object(installer, "git", side_effect=answers), patch.object(installer, "ENGINE_BLOB", installer.git_blob(FIXTURE.encode())):
                 report = installer.install(root, True)

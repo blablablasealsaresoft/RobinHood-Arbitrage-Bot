@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { address, hash32, uint } from './core.mjs';
+import { assertOwnedPrivate } from './fs-privacy.mjs';
 
 export const NITRO_REVISION = 'a618155919315241665356fe60f3cd00d66d5e46';
 const MAX_BYTES = 1_048_576;
@@ -82,12 +83,22 @@ export function validateExecutionManifest(raw, config, book) {
 export function loadExecutionManifest(config, book) {
   if (typeof config.executionManifest !== 'string' || !path.isAbsolute(config.executionManifest)) throw new Error('absolute executionManifest path required');
   const stat = fs.lstatSync(config.executionManifest);
-  if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o777) !== 0o600 || stat.size > MAX_BYTES) throw new Error('execution manifest must be owned regular 0600 file');
+  assertOwnedPrivate(config.executionManifest, {
+    kind: 'file',
+    posixExactMode: 0o600,
+    message: 'execution manifest must be owned regular 0600 file',
+  });
+  if (stat.size > MAX_BYTES) throw new Error('execution manifest must be owned regular 0600 file');
   return validateExecutionManifest(fs.readFileSync(config.executionManifest), config, book);
 }
 
 export function assertExecutionSocket(socketPath, expected) {
   if (!path.isAbsolute(socketPath) || path.resolve(socketPath) !== socketPath || socketPath !== expected) throw new Error('execution socket differs from reviewed manifest');
-  const parent = path.dirname(socketPath), stat = fs.lstatSync(parent);
-  if (fs.realpathSync(parent) !== parent || !stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o777) !== 0o700) throw new Error('execution socket parent must be owned non-symlink 0700 directory');
+  const parent = path.dirname(socketPath);
+  if (fs.realpathSync(parent) !== parent) throw new Error('execution socket parent must be owned non-symlink 0700 directory');
+  assertOwnedPrivate(parent, {
+    kind: 'directory',
+    posixExactMode: 0o700,
+    message: 'execution socket parent must be owned non-symlink 0700 directory',
+  });
 }

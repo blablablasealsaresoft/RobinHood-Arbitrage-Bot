@@ -58,6 +58,14 @@ test('an internal dispatch-journal failure stops nonce reuse and performs no POS
   const [a,b]=initial();await f.engine.onFrame(a);await assert.rejects(f.engine.onFrame(b),/disk full/);
   assert.equal(sent,0);assert.equal(f.nonces.blocked,true);
 });
+test('native validator keeps race tests and resolves Windows PATHEXT without skipping stages',()=>{
+  const s=fs.readFileSync('scripts/validate-native.mjs','utf8');
+  assert.match(s,/shell:true/);
+  assert.match(s,/\['-C','native\/nitro-exporter','test','-race'/);
+  assert.match(s,/GOPROXY:'off'/);
+  assert.doesNotMatch(s,/skip.*exporter-go-tests|GOPROXY:'on'/);
+});
+
 test('phase and callback binding source regression (not an EVM execution test)',()=>{
   const s=fs.readFileSync('contracts/SequencerFlashArbExecutorV4.sol','utf8');
   assert.match(s,/pendingCallbackHash = keccak256\(callbackData\)/);

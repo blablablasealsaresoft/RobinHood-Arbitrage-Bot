@@ -273,6 +273,13 @@ contract SequencerFlashArbExecutorV4 {
         pendingMinProfit = 0;
         pendingBaseline = 0;
 
+        _emitFlashArbitrage(digest, intent, profit);
+    }
+
+    // Keep this emit off the executeFlashArb stack. The repository compiler
+    // settings are paris + optimizer 500 + via_ir=false; do not flip via_ir
+    // just to paper over too many live locals around the success event.
+    function _emitFlashArbitrage(bytes32 digest, FlashIntent calldata intent, uint256 profit) private {
         emit FlashArbitrage(
             digest, intent.anchorBlock, intent.anchorBlockHash, intent.triggerTxHash,
             intent.settlementToken, intent.borrowAmount, profit, msg.sender

@@ -69,7 +69,7 @@ export function decodeTransaction(raw) {
 
   if (!layout) {
     return {
-      txType, txHash, to: null, selector: null, dataHex: '0x',
+      raw, txType, txHash, to: null, selector: null, dataHex: '0x',
       valueWei: '0', nonce: '0', gas: '0', dataLength: 0,
     };
   }
@@ -79,7 +79,7 @@ export function decodeTransaction(raw) {
   try { fields = scanRlpList(body); }
   catch {
     return {
-      txType, txHash, to: null, selector: null, dataHex: '0x',
+      raw, txType, txHash, to: null, selector: null, dataHex: '0x',
       valueWei: '0', nonce: '0', gas: '0', dataLength: 0,
     };
   }
@@ -91,6 +91,7 @@ export function decodeTransaction(raw) {
   const data = payloadSlice(body, fields[dataIndex]);
 
   return {
+    raw,
     txType,
     txHash,
     to: toBytes.length === 20 ? '0x' + toBytes.toString('hex') : null,

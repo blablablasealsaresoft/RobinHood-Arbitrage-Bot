@@ -3,6 +3,7 @@ import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import { uint, hash32, stable } from './core.mjs';
+import { applyOwnedPrivate, assertOwnedPrivate } from './fs-privacy.mjs';
 
 // One persistent connection pool per path; the only hot-path method is
 // eth_sendRawTransaction. Never call wallet.populateTransaction here.
@@ -147,10 +148,20 @@ export class RelayerJournal {
   constructor(directory, relayer) {
     const name = relayer.toLowerCase();
     if (!/^0x[0-9a-f]{40}$/.test(name)) throw new Error('invalid relayer');
+    const existed = fs.existsSync(directory);
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     const stat = fs.lstatSync(directory);
-    if (!stat.isDirectory() || (stat.mode & 0o077) || (process.getuid && stat.uid !== process.getuid())) throw new Error('private owned runtime directory required');
-    this.dirFd = fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+    if (!stat.isDirectory()) throw new Error('private owned runtime directory required');
+    if (!existed) applyOwnedPrivate(directory, { kind: 'directory' });
+    assertOwnedPrivate(directory, {
+      kind: 'directory',
+      posixForbidGroupWorld: true,
+      message: 'private owned runtime directory required',
+    });
+    const dirFlags = process.platform === 'win32'
+      ? fs.constants.O_RDWR
+      : fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0);
+    this.dirFd = fs.openSync(directory, dirFlags);
     const opened = fs.fstatSync(this.dirFd);
     if (opened.ino !== stat.ino || opened.dev !== stat.dev) { fs.closeSync(this.dirFd); throw new Error('runtime directory changed'); }
     this.lock = path.join(directory, `${name}.lock`);

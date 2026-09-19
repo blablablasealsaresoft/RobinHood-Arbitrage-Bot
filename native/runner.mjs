@@ -7,6 +7,7 @@ import { RouteBook, MarketState, NativeEngine, NonceCoordinator, normalizeCosts,
 import { RawBroadcaster, Telemetry, RelayerJournal } from './transport.mjs';
 import { SettlementLedger } from './accounting.mjs';
 import { loadExecutionManifest, assertExecutionSocket } from './execution-provenance.mjs';
+import { assertOwnedPrivate } from './fs-privacy.mjs';
 
 export async function* frames(stream, maxBytes = 1_048_576) {
   let pending = Buffer.alloc(0);
@@ -148,7 +149,14 @@ export async function run(args = process.argv.slice(2)) {
     if (opt.socket) {
       if (opt.live) assertExecutionSocket(opt.socket, live.provenance.socketPath);
       const info = fs.lstatSync(opt.socket);
-      if (!info.isSocket() || (opt.live && ((info.mode & 0o077) !== 0 || info.uid !== process.getuid()))) throw new Error('live execution socket must be owner-only and owned by this process user');
+      if (!info.isSocket()) throw new Error('live execution socket must be owner-only and owned by this process user');
+      if (opt.live) {
+        assertOwnedPrivate(opt.socket, {
+          kind: 'socket',
+          posixForbidGroupWorld: true,
+          message: 'live execution socket must be owner-only and owned by this process user',
+        });
+      }
       input = net.createConnection(opt.socket);
     } else input = fs.createReadStream(opt.replay);
     process.once('SIGINT', stop); process.once('SIGTERM', stop);
