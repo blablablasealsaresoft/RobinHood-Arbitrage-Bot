@@ -24,6 +24,8 @@ import { CURVE_ABI, QUOTER_ABI } from './abis.js';
 import { CURVE, V4, TOKEN, POOLS } from './config.js';
 import { notifyStartup, notifyAtomic, notifyError, notifyPoll, notifyNoMarkets, tg, tgEnabled } from './telegram.js';
 import { bpsDown, buildGrid, envInteger, feeOverrides, serialRunner } from './risk.js';
+import { aggressiveGate } from './aggressive-policy.js';
+import { signAndBroadcast } from './broadcast.js';
 
 const EXECUTOR_ABI = [
   'function curveToV4(address token,uint256 ethIn,uint256 minTokensOut,(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks) key,uint128 minEthOut,uint256 minProfit)',
@@ -41,7 +43,7 @@ if (CLI_LIVE && CLI_DRY_RUN) throw new Error('cannot combine --live and --dry-ru
 const CFG = {
   minSize: parseEther(process.env.MIN_SIZE_ETH || '0.002'),
   maxSize: parseEther(process.env.MAX_SIZE_ETH || '0.005'),
-  minProfitBps: BigInt(envInteger('MIN_PROFIT_BPS', 150, { min: 1, max: 5000 })),
+  minProfitBps: BigInt(envInteger('MIN_PROFIT_BPS', 0, { min: 0, max: 5000 })),
   slippageBps: BigInt(envInteger('SLIPPAGE_BPS', 100, { min: 0, max: 2000 })),
   pollMs: envInteger('POLL_MS', 45000, { min: 1000, max: 3600000 }),
   eventPollMs: envInteger('EVENT_POLL_MS', 6000, { min: 1000, max: 60000 }),
@@ -197,10 +199,14 @@ async function main() {
     const minEth = b.size + minProfit;
     const minTok = bpsDown(b.tok, CFG.slippageBps);
     console.log(`  [atomic ${b.dir}] ${b.market.symbol} pool=${b.pool.name} size=${formatEther(b.size)}`);
-    const tx = b.dir === 'A'
-      ? await executor.curveToV4(token, b.size, minTok, keyTuple(b.pool.key), minEth, minProfit, b.txOverrides)
-      : await executor.v4ToCurve(token, b.size, minTok, keyTuple(b.pool.key), minEth, minProfit, b.txOverrides);
-    const rc = await tx.wait();
+    const txReq = b.dir === 'A'
+      ? await executor.curveToV4.populateTransaction(token, b.size, minTok, keyTuple(b.pool.key), minEth, minProfit)
+      : await executor.v4ToCurve.populateTransaction(token, b.size, minTok, keyTuple(b.pool.key), minEth, minProfit);
+    Object.assign(txReq, b.txOverrides);
+    const sent = await signAndBroadcast(execWallet, txReq);
+    console.log('  broadcast', sent.txHash, sent.results.map(x => x.ok ? 'ok' : 'fail').join('/'));
+    const rc = await execProvider.waitForTransaction(sent.txHash, 1, Number(process.env.RECEIPT_TIMEOUT_MS || 30000));
+    if (!rc) throw new Error('receipt timeout');
     console.log('  tx', rc.hash);
     notifyAtomic({ symbol: b.market.symbol, dir: b.dir, buyVenue: b.dir === 'A' ? 'curve' : `V4 ${b.pool.name}`, sellVenue: b.dir === 'A' ? `V4 ${b.pool.name}` : 'curve', sizeEth: b.size, receipt: rc, netEth: 0n }).catch(() => {});
   }
@@ -220,7 +226,8 @@ async function main() {
       notifyPoll({ trigger, symbol: b.market.symbol, route: b.tag, pool: b.pool?.name,
         size: b.size, net: b.net, bps, gateBps: CFG.minProfitBps }).catch(() => {});
     }
-    if (bps >= CFG.minProfitBps) {
+    const gate = aggressiveGate({ size: b.size, netAfterGas: b.net });
+    if (gate.pass) {
       console.log('>>> OPPORTUNITY', line);
       if (!CFG.live || !wallet) { console.log('    (idle: dry-run/no wallet)'); return; }
       try {
@@ -230,7 +237,7 @@ async function main() {
         notifyError(`${b.market.symbol} ${b.tag}: ${e.shortMessage || e.message}`).catch(() => {});
       }
     } else if (Date.now() - lastLog > 15000 || trigger === 'swap') {
-      lastLog = Date.now(); console.log('idle    ', line);
+      lastLog = Date.now(); console.log('idle    ', line + ` requiredNet=${formatEther(gate.required)}`);
     }
   }
   const tick = serialRunner(tickBody, (e) => console.error('queued tick:', e));
