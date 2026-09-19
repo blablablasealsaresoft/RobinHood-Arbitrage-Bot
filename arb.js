@@ -18,12 +18,15 @@
 
 import 'dotenv/config';
 import fs from 'node:fs';
-import { Contract, Wallet, JsonRpcProvider, Network, parseEther, formatEther, id as topicId, getAddress, AbiCoder, keccak256 } from 'ethers';
+import { Contract, Wallet, JsonRpcProvider, Network, Interface, parseEther, formatEther, id as topicId, getAddress, AbiCoder, keccak256 } from 'ethers';
 import { makeProvider } from './provider.js';
 import { CURVE_ABI, QUOTER_ABI } from './abis.js';
 import { CURVE, V4, TOKEN, POOLS } from './config.js';
 import { notifyStartup, notifyAtomic, notifyError, notifyPoll, notifyNoMarkets, tg, tgEnabled } from './telegram.js';
 import { bpsDown, buildGrid, envInteger, feeOverrides, serialRunner } from './risk.js';
+import { SequencerFeedClient } from './sequencer-feed.js';
+import { createLatencyRecorder } from './latency.js';
+import { buildFlashIntent, genericStateCheck, signFlashIntent } from './flash-intent.js';
 
 const EXECUTOR_ABI = [
   'function curveToV4(address token,uint256 ethIn,uint256 minTokensOut,(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks) key,uint128 minEthOut,uint256 minProfit)',
@@ -33,6 +36,16 @@ const EXECUTOR_ABI = [
   'function allowedPools(bytes32) view returns (bool)',
   'function paused() view returns (bool)',
 ];
+
+const FLASH_EXECUTOR_ABI = [
+  'function executeFlashArb((address settlementToken,uint256 borrowAmount,uint256 minProfit,uint256 maxGasPrice,uint64 validAfterBlock,uint64 validUntilBlock,uint64 deadline,uint256 nonce,bytes32 triggerTxHash,bytes32 routeHash,bytes32 stateChecksHash) intent,(address adapter,address tokenIn,address tokenOut,uint256 minOut,bytes data)[] legs,(uint8 mode,address target,bytes callData,bytes32 expectedReturnHash)[] checks,bytes signature)',
+];
+const WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';
+const CURVE_STATE = new Interface(CURVE_ABI);
+const V4_STATE = new Interface([
+  'function getSlot0(bytes32 poolId) view returns (uint160 sqrtPriceX96,int24 tick,uint24 protocolFee,uint24 lpFee)',
+  'function getLiquidity(bytes32 poolId) view returns (uint128 liquidity)',
+]);
 
 const CLI_LIVE = process.argv.includes('--live');
 const CLI_DRY_RUN = process.argv.includes('--dry-run');
@@ -52,8 +65,28 @@ const CFG = {
   executor: process.env.EXECUTOR_ADDR || null,
   watchlist: process.env.WATCHLIST === '1',
   once: process.argv.includes('--once'),
+  sequencerFeed: process.env.SEQUENCER_FEED === '1',
+  sequencerTriggerMinMs: envInteger('SEQUENCER_TRIGGER_MIN_MS', 500, { min: 0, max: 60000 }),
+  sequencerLiveMaxAgeMs: envInteger('SEQUENCER_LIVE_MAX_AGE_MS', 5000, { min: 100, max: 60000 }),
+  sequencerFilterMode: process.env.SEQUENCER_FILTER_MODE || 'targets',
+  flashMode: process.env.SEQUENCER_FLASH_MODE === '1',
+  flashExecutor: process.env.SEQUENCER_EXECUTOR_ADDR || null,
+  curveAdapter: process.env.ROBIN_FUN_WETH_ADAPTER || null,
+  v4Adapter: process.env.UNISWAP_V4_WETH_ADAPTER || null,
+  flashGasUnits: BigInt(envInteger('FLASH_GAS_UNITS', 1500000, { min: 300000, max: 5000000 })),
+  flashBlockWindow: envInteger('FLASH_BLOCK_WINDOW', 2, { min: 1, max: 16 }),
+  flashDeadlineSeconds: envInteger('FLASH_DEADLINE_SECONDS', 5, { min: 1, max: 60 }),
+  sequencerMaxBlockLag: envInteger('SEQUENCER_MAX_BLOCK_LAG', 8, { min: 0, max: 1000 }),
+  submitRpcUrl: process.env.SUBMIT_RPC_URL || (process.env.DIRECT_SEQUENCER_SUBMIT === '1'
+    ? 'https://sequencer.mainnet.chain.robinhood.com'
+    : null),
 };
 if (CFG.minSize <= 0n || CFG.maxSize < CFG.minSize) throw new Error('invalid MIN_SIZE_ETH/MAX_SIZE_ETH');
+if (!['targets','all'].includes(CFG.sequencerFilterMode)) throw new Error('SEQUENCER_FILTER_MODE must be targets or all');
+if (CFG.flashMode && !CFG.sequencerFeed) throw new Error('SEQUENCER_FLASH_MODE requires SEQUENCER_FEED=1');
+if (CFG.flashMode && (!CFG.flashExecutor || !CFG.curveAdapter || !CFG.v4Adapter)) {
+  throw new Error('SEQUENCER_FLASH_MODE requires SEQUENCER_EXECUTOR_ADDR, ROBIN_FUN_WETH_ADAPTER and UNISWAP_V4_WETH_ADAPTER');
+}
 const keyTuple = (k) => [k.currency0, k.currency1, k.fee, k.tickSpacing, k.hooks];
 const ABI_CODER = AbiCoder.defaultAbiCoder();
 const ZERO = '0x0000000000000000000000000000000000000000';
@@ -101,13 +134,14 @@ async function main() {
   // If only a private execution RPC is configured, share it for monitoring too.
   // This avoids silently falling back to the less reliable public RPC while the
   // user already has a working private endpoint.
-  const monitorRpcUrl = process.env.RPC_URL || process.env.EXEC_RPC_URL || null;
+  const monitorRpcUrl = process.env.FAST_RPC_URL || process.env.RPC_URL || process.env.EXEC_RPC_URL || null;
   const provider = await makeProvider({ rpcUrl: monitorRpcUrl });
   provider.pollingInterval = CFG.eventPollMs;
-  console.log(`monitor RPC: ${monitorRpcUrl ? (process.env.RPC_URL ? 'dedicated/private' : 'shared execution RPC') : 'pinned public'}`);
+  console.log(`monitor RPC: ${monitorRpcUrl ? (process.env.FAST_RPC_URL ? 'fast/local' : (process.env.RPC_URL ? 'dedicated/private' : 'shared execution RPC')) : 'pinned public'}`);
   const wallet = process.env.PRIVATE_KEY ? new Wallet(process.env.PRIVATE_KEY, provider) : null;
   if (CFG.live && !wallet) throw new Error('LIVE requires PRIVATE_KEY');
-  if (CFG.live && !CFG.executor) throw new Error('LIVE requires EXECUTOR_ADDR; unsafe EOA mode is disabled');
+  if (CFG.live && !CFG.executor && !CFG.flashMode) throw new Error('LIVE requires EXECUTOR_ADDR or SEQUENCER_FLASH_MODE; unsafe EOA mode is disabled');
+  if (CFG.live && CFG.flashMode && !process.env.STRATEGY_PRIVATE_KEY) throw new Error('live sequencer flash mode requires STRATEGY_PRIVATE_KEY');
   const runner = provider;
 
   // Dedicated EXECUTION provider (e.g. Alchemy) — reliable for trade txs, keeps the
@@ -120,10 +154,26 @@ async function main() {
     console.log('exec RPC: dedicated');
   }
 
+  let submitProvider = null;
+  if (CFG.submitRpcUrl && wallet) {
+    const enet = new Network('robinhood', 4663);
+    submitProvider = new JsonRpcProvider(CFG.submitRpcUrl, enet, { staticNetwork: enet });
+    console.log('submit RPC:', process.env.DIRECT_SEQUENCER_SUBMIT === '1' ? 'direct sequencer' : 'dedicated');
+  }
+
   let markets = validateMarkets(loadMarkets());
+  const sequencerTargets = new Set([
+    CURVE.address,
+    V4.poolManager,
+    V4.universalRouter,
+    ...markets.map((m) => m.token),
+  ].map((x) => x.toLowerCase()));
   const curve = new Contract(CURVE.address, CURVE_ABI, runner);
   const quoter = new Contract(V4.quoter, QUOTER_ABI, provider);
-  const executor = CFG.executor && execWallet ? new Contract(CFG.executor, EXECUTOR_ABI, execWallet) : null;
+  const executor = !CFG.flashMode && CFG.executor && execWallet ? new Contract(CFG.executor, EXECUTOR_ABI, execWallet) : null;
+  const flashExecutor = CFG.flashMode && CFG.flashExecutor && execWallet
+    ? new Contract(CFG.flashExecutor, FLASH_EXECUTOR_ABI, execWallet)
+    : null;
 
   if (executor) {
     const [rawChainId, code, owner, contractMax, isPaused] = await Promise.all([
@@ -146,8 +196,9 @@ async function main() {
   }
 
   let gasPolicy = feeOverrides(await execProvider.getFeeData(), CFG.gasUnits, CFG.gasBufferBps);
+  const latency = createLatencyRecorder();
 
-  console.log(`\nRobinFun<->UniV4 arb | ${CFG.live ? 'LIVE' : 'DRY-RUN'} | ${executor ? 'ATOMIC' : 'MONITOR'} | ${CFG.watchlist ? 'WATCHLIST' : 'single'}`);
+  console.log(`\nRobinFun<->UniV4 arb | ${CFG.live ? 'LIVE' : 'DRY-RUN'} | ${CFG.flashMode ? 'SEQUENCER-FLASH' : (executor ? 'ATOMIC' : 'MONITOR')} | ${CFG.watchlist ? 'WATCHLIST' : 'single'}`);
   console.log(`wallet: ${wallet ? wallet.address : '(monitor only)'}`);
   console.log(`markets: ${markets.map(m => `${m.symbol}(${m.pools.map(p => p.name).join('/')})`).join(', ')}`);
   console.log(`gate >= ${CFG.minProfitBps} bps | size [${formatEther(CFG.minSize)}, ${formatEther(CFG.maxSize)}] ETH\n`);
@@ -205,9 +256,137 @@ async function main() {
     notifyAtomic({ symbol: b.market.symbol, dir: b.dir, buyVenue: b.dir === 'A' ? 'curve' : `V4 ${b.pool.name}`, sellVenue: b.dir === 'A' ? `V4 ${b.pool.name}` : 'curve', sizeEth: b.size, receipt: rc, netEth: 0n }).catch(() => {});
   }
 
+  let flashNonce = BigInt(Date.now()) << 32n;
+
+  function v4AdapterData(key) {
+    return ABI_CODER.encode(
+      ['tuple(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks)'],
+      [keyTuple(key)],
+    );
+  }
+
+  async function stateLocksFor(b) {
+    const token = b.market.token;
+    const curveCall = CURVE_STATE.encodeFunctionData('curves', [token]);
+    const slot0Call = V4_STATE.encodeFunctionData('getSlot0', [b.pool.id]);
+    const liquidityCall = V4_STATE.encodeFunctionData('getLiquidity', [b.pool.id]);
+    const [curveReturn, slot0Return, liquidityReturn] = await Promise.all([
+      provider.call({ to: CURVE.address, data: curveCall }),
+      provider.call({ to: V4.stateView, data: slot0Call }),
+      provider.call({ to: V4.stateView, data: liquidityCall }),
+    ]);
+    return [
+      genericStateCheck(CURVE.address, curveCall, curveReturn),
+      genericStateCheck(V4.stateView, slot0Call, slot0Return),
+      genericStateCheck(V4.stateView, liquidityCall, liquidityReturn),
+    ];
+  }
+
+  async function executeFlash(b, sequencerContext) {
+    if (!flashExecutor) throw new Error('sequencer flash executor unavailable');
+    if (!process.env.STRATEGY_PRIVATE_KEY) throw new Error('STRATEGY_PRIVATE_KEY missing');
+    if (!sequencerContext?.triggerTxHash || !sequencerContext?.sequenceNumber) {
+      throw new Error('missing sequencer trigger context');
+    }
+
+    const targetBlock = BigInt(sequencerContext.sequenceNumber);
+    const head = BigInt(await provider.getBlockNumber());
+    if (head < targetBlock) throw new Error(`fast RPC behind sequencer target: head=${head} target=${targetBlock}`);
+    if (head - targetBlock > BigInt(CFG.sequencerMaxBlockLag)) {
+      throw new Error(`sequencer opportunity stale by ${head - targetBlock} blocks`);
+    }
+
+    const minProfit = (b.size * CFG.minProfitBps) / 10000n + b.gasCost;
+    const finalMin = b.size + minProfit;
+    const minTok = bpsDown(b.tok, CFG.slippageBps);
+    const poolData = v4AdapterData(b.pool.key);
+    const legs = b.dir === 'A'
+      ? [
+          { adapter: CFG.curveAdapter, tokenIn: WETH, tokenOut: b.market.token, minOut: minTok, data: '0x' },
+          { adapter: CFG.v4Adapter, tokenIn: b.market.token, tokenOut: WETH, minOut: finalMin, data: poolData },
+        ]
+      : [
+          { adapter: CFG.v4Adapter, tokenIn: WETH, tokenOut: b.market.token, minOut: minTok, data: poolData },
+          { adapter: CFG.curveAdapter, tokenIn: b.market.token, tokenOut: WETH, minOut: finalMin, data: '0x' },
+        ];
+
+    const checks = await stateLocksFor(b);
+    const maxGasPrice = b.txOverrides.maxFeePerGas ?? b.txOverrides.gasPrice;
+    if (!maxGasPrice) throw new Error('missing bounded gas price');
+
+    const nonce = flashNonce++;
+    const intent = buildFlashIntent({
+      settlementToken: WETH,
+      borrowAmount: b.size,
+      minProfit,
+      maxGasPrice,
+      validAfterBlock: head,
+      validUntilBlock: head + BigInt(CFG.flashBlockWindow),
+      deadline: BigInt(Math.floor(Date.now() / 1000) + CFG.flashDeadlineSeconds),
+      nonce,
+      triggerTxHash: sequencerContext.triggerTxHash,
+      legs,
+      stateChecks: checks,
+    });
+    const signature = await signFlashIntent({
+      privateKey: process.env.STRATEGY_PRIVATE_KEY,
+      executor: CFG.flashExecutor,
+      intent,
+    });
+
+    let txHash;
+    let receipt;
+    const submitStartedAt = Date.now();
+    if (submitProvider) {
+      const request = await flashExecutor.executeFlashArb.populateTransaction(
+        intent, legs, checks, signature, b.txOverrides,
+      );
+      request.nonce = await execProvider.getTransactionCount(execWallet.address, 'pending');
+      request.chainId = 4663;
+      const raw = await execWallet.signTransaction(request);
+      txHash = await submitProvider.send('eth_sendRawTransaction', [raw]);
+    } else {
+      const tx = await flashExecutor.executeFlashArb(intent, legs, checks, signature, b.txOverrides);
+      txHash = tx.hash;
+    }
+    const submittedAt = Date.now();
+    latency.record('flash-submitted', {
+      triggerTxHash: sequencerContext.triggerTxHash,
+      targetBlock: targetBlock.toString(),
+      stateBlock: head.toString(),
+      symbol: b.market.symbol,
+      direction: b.dir,
+      txHash,
+      directSequencer: Boolean(submitProvider),
+      feedToSubmitMs: sequencerContext.receivedAt ? submittedAt - sequencerContext.receivedAt : null,
+      submitCallMs: submittedAt - submitStartedAt,
+      borrowWei: b.size.toString(),
+      minProfitWei: minProfit.toString(),
+    });
+    receipt = await execProvider.waitForTransaction(txHash);
+    latency.record('flash-confirmed', {
+      txHash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+      submitToConfirmMs: Date.now() - submittedAt,
+    });
+    console.log('  flash tx', receipt.hash || txHash);
+    notifyAtomic({
+      symbol: b.market.symbol,
+      dir: b.dir,
+      buyVenue: b.dir === 'A' ? 'curve' : `V4 ${b.pool.name}`,
+      sellVenue: b.dir === 'A' ? `V4 ${b.pool.name}` : 'curve',
+      sizeEth: b.size,
+      receipt,
+      netEth: 0n,
+    }).catch(() => {});
+  }
+
   let lastLog = 0;
+  let lastSequencerContext = null;
   async function tickBody(trigger = 'poll') {
-    gasPolicy = feeOverrides(await execProvider.getFeeData(), CFG.gasUnits, CFG.gasBufferBps);
+    const tickStartedAt = Date.now();
+    const gasUnits = CFG.flashMode && trigger === 'sequencer' ? CFG.flashGasUnits : CFG.gasUnits;
+    gasPolicy = feeOverrides(await execProvider.getFeeData(), gasUnits, CFG.gasBufferBps);
     const all = await scanAll();
     if (!all.length) {
       if (trigger === 'poll' || trigger === 'boot') notifyNoMarkets(trigger).catch(() => {});
@@ -215,16 +394,26 @@ async function main() {
     }
     const b = all[0];
     const bps = b.size > 0n ? (b.net * 10000n) / b.size : 0n;
+    if (trigger === 'sequencer') latency.record('scan', { scanMs: Date.now() - tickStartedAt, symbol: b.market.symbol, direction: b.dir, bps: bps.toString() });
     const line = `${new Date().toISOString()} [${trigger}] best=${b.market.symbol} ${b.tag}@${b.pool?.name} size=${formatEther(b.size)} net=${formatEther(b.net)} (${bps} bps)`;
     if (trigger === 'poll' || trigger === 'boot') {
       notifyPoll({ trigger, symbol: b.market.symbol, route: b.tag, pool: b.pool?.name,
         size: b.size, net: b.net, bps, gateBps: CFG.minProfitBps }).catch(() => {});
     }
     if (bps >= CFG.minProfitBps) {
+      latency.record('opportunity', { trigger, symbol: b.market.symbol, direction: b.dir, bps: bps.toString(), netWei: b.net.toString(), sizeWei: b.size.toString(), scanMs: Date.now() - tickStartedAt });
       console.log('>>> OPPORTUNITY', line);
       if (!CFG.live || !wallet) { console.log('    (idle: dry-run/no wallet)'); return; }
       try {
-        await execute(b);
+        if (CFG.flashMode) {
+          if (trigger !== 'sequencer') {
+            console.log('    (idle: sequencer flash mode only executes sequencer-triggered opportunities)');
+            return;
+          }
+          await executeFlash(b, lastSequencerContext);
+        } else {
+          await execute(b);
+        }
       } catch (e) {
         console.log('    exec FAILED:', e.shortMessage || e.message);
         notifyError(`${b.market.symbol} ${b.tag}: ${e.shortMessage || e.message}`).catch(() => {});
@@ -252,6 +441,63 @@ async function main() {
     console.error('unhandledRejection:', e);
     setImmediate(() => process.exit(1));
   });
+
+  let sequencerFeed = null;
+  let lastSequencerTriggerAt = 0;
+  if (CFG.sequencerFeed && !CFG.once) {
+    sequencerFeed = new SequencerFeedClient({
+      maxLiveAgeMs: CFG.sequencerLiveMaxAgeMs,
+      onBatch: (batch) => {
+        const matched = batch.transactions.filter((tx) => tx.to && sequencerTargets.has(tx.to.toLowerCase()));
+        latency.record('feed', {
+          sequenceNumber: batch.lastSequenceNumber,
+          messageCount: batch.messageCount,
+          transactionCount: batch.transactions.length,
+          matchedCount: matched.length,
+          live: batch.live,
+          messageAgeMs: batch.messageAgeMs,
+          frameBytes: batch.frameBytes,
+        });
+        if (!batch.live) return;
+        if (CFG.sequencerFilterMode === 'targets' && matched.length === 0) return;
+        if (CFG.flashMode && matched.length === 0) return;
+
+        const targetTx = matched.length ? matched[matched.length - 1] : batch.transactions[batch.transactions.length - 1];
+        const triggerTxHash = targetTx?.raw ? keccak256(targetTx.raw) : null;
+        lastSequencerContext = {
+          receivedAt: batch.receivedAt,
+          sequenceNumber: targetTx?.sequenceNumber || batch.lastSequenceNumber,
+          triggerTxHash,
+          to: targetTx?.to || null,
+          selector: targetTx?.selector || null,
+          valueWei: targetTx?.valueWei || '0',
+        };
+
+        const now = Date.now();
+        if (now - lastSequencerTriggerAt < CFG.sequencerTriggerMinMs) return;
+        lastSequencerTriggerAt = now;
+        latency.record('trigger', {
+          sequenceNumber: lastSequencerContext.sequenceNumber,
+          triggerTxHash,
+          matched: matched.slice(0, 8).map((tx) => ({
+            to: tx.to,
+            selector: tx.selector,
+            valueWei: tx.valueWei,
+            txType: tx.txType,
+          })),
+        });
+        tick('sequencer').catch((e) => console.error('sequencer tick:', e));
+      },
+      onStatus: (status) => {
+        latency.record('feed-status', { type: status.type, error: status.error || null });
+        if (status.type === 'connected') console.log('sequencer feed: connected');
+        else if (status.type === 'disconnected') console.log('sequencer feed: disconnected; reconnecting');
+        else if (status.type === 'error') console.warn('sequencer feed:', status.error);
+      },
+    });
+    try { sequencerFeed.start(); }
+    catch (e) { console.warn('sequencer feed disabled:', e.message); sequencerFeed = null; }
+  }
 
   // event-driven: ONE subscription for all watched pools (topic1 = OR of poolIds)
   const swapTopic = topicId('Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)');
@@ -304,6 +550,7 @@ async function main() {
         if (!m.pools.some((p) => p.id.toLowerCase() === poolIdLc)) m.pools.push(pool);
       } else {
         m = { token: c1, symbol: sym, pools: [pool] }; markets.push(m);
+        sequencerTargets.add(c1.toLowerCase());
       }
       provider.on({ address: V4.poolManager, topics: [swapTopic, poolId] }, () => tick('swap').catch(e => console.error('tick:', e)));
       persistWatchlist();
@@ -315,17 +562,29 @@ async function main() {
   try { provider.on({ address: V4.poolManager, topics: [initTopic] }, (log) => onNewPool(log)); }
   catch (e) { console.log('init sub failed:', e?.message); }
 
-  const mode = `${CFG.live ? 'LIVE' : 'DRY-RUN'}/${executor ? 'ATOMIC' : 'MONITOR'}`;
+  const mode = `${CFG.live ? 'LIVE' : 'DRY-RUN'}/${CFG.flashMode ? 'SEQUENCER-FLASH' : (executor ? 'ATOMIC' : 'MONITOR')}`;
   console.log('telegram:', tgEnabled ? 'ON' : 'off');
   await notifyStartup(mode, markets);
   await tick('boot');
   if (CFG.once) {
+    sequencerFeed?.stop();
     provider.removeAllListeners();
     provider.destroy();
     if (execProvider !== provider) execProvider.destroy();
+    submitProvider?.destroy();
     return;
   }
-  setInterval(() => tick('poll').catch(e => console.error('tick:', e)), CFG.pollMs);
+  const pollTimer = setInterval(() => tick('poll').catch(e => console.error('tick:', e)), CFG.pollMs);
+  pollTimer.unref?.();
+  for (const sig of ['SIGINT', 'SIGTERM']) process.once(sig, () => {
+    sequencerFeed?.stop();
+    clearInterval(pollTimer);
+    provider.removeAllListeners();
+    provider.destroy();
+    if (execProvider !== provider) execProvider.destroy();
+    submitProvider?.destroy();
+    process.exit(0);
+  });
 }
 
 main().catch(e => { console.error('FATAL', e); process.exit(1); });

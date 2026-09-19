@@ -82,6 +82,65 @@ RPC selection works as follows:
 
 `RPC_URL` and `EXEC_RPC_URL` may point to the same private Alchemy endpoint.
 
+## Sequencer fast path
+
+Robinhood Chain publishes a Nitro sequencer feed at `wss://feed.mainnet.chain.robinhood.com`. When `SEQUENCER_FEED=1`, the bot uses incoming sequencer batches as an additional low-latency trigger for the existing atomic arb scan. The feed does **not** enable live trading and does not bypass the executor's profit/risk checks.
+
+Validate feed connectivity without a wallet:
+
+```powershell
+npm run sequencer:smoke
+```
+
+Recommended staged setup:
+
+```env
+SEQUENCER_FEED=1
+SEQUENCER_TRIGGER_MIN_MS=500
+SEQUENCER_LIVE_MAX_AGE_MS=5000
+SEQUENCER_FILTER_MODE=targets
+FAST_RPC_URL=
+LATENCY_LOG=./logs/sequencer-latency.jsonl
+```
+
+`FAST_RPC_URL` is optional. For the lowest state latency, run a local Robinhood Nitro node with `--node.feed.input.url=wss://feed.mainnet.chain.robinhood.com` and point `FAST_RPC_URL` at that node. Without it, sequencer batches still trigger scans, but the ordinary RPC can lag behind the feed and return pre-batch state.
+
+The fast path remains serialized through the existing `serialRunner`; a burst of sequencer messages coalesces rather than launching overlapping nonce/execution work. `SEQUENCER_TRIGGER_MIN_MS` bounds quote load. `SEQUENCER_LIVE_MAX_AGE_MS` prevents replayed backlog from triggering scans. In `targets` mode, decoded feed transactions must touch the RobinFun curve, V4 router/manager, or a watched token before a sequencer scan fires. Feed, scan, and opportunity timing is written as JSONL to `LATENCY_LOG`.
+
+
+## Sequencer flash-backrun mode
+
+The optional V3 path can fund the current RobinFun <-> V4 opportunity with a Morpho Blue WETH flash loan. It remains disabled unless `SEQUENCER_FLASH_MODE=1` and all deployed addresses/signers are supplied.
+
+Current verified dependencies used by `deploy:sequencer`:
+
+- Morpho Blue: `0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010`
+- Canonical Robinhood WETH: `0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73`
+- V4 Universal Router and Permit2: the existing verified values in `config.js`
+
+Build first:
+
+```powershell
+npm test
+npm run build:contract
+```
+
+Deployment is fail-closed and requires explicit Safe owner, strategy signer and treasury:
+
+```powershell
+$env:SAFE_OWNER="0x..."
+$env:STRATEGY_SIGNER="0x..."
+$env:TREASURY="0x..."
+$env:MAX_BLOCK_WINDOW="2"
+npm run deploy:sequencer
+```
+
+Deployment does not enable a relayer, adapter, token, pool or borrow cap. Those must be reviewed and enabled through the Safe before flash mode can execute.
+
+The sequencer flash path binds each opportunity to the relevant decoded feed transaction hash, snapshots RobinFun curve state plus V4 slot0/liquidity, signs those hashes into the EIP-712 intent, then rechecks them onchain before Morpho is asked to lend. The executor requires a closed WETH route, per-leg minimum outputs, a bounded gas price, nonce freshness, a tiny block/time window, and profit both before and after Morpho pulls repayment.
+
+Set `DIRECT_SEQUENCER_SUBMIT=1` to submit the locally signed raw transaction to `https://sequencer.mainnet.chain.robinhood.com` while keeping reads and receipt tracking on `FAST_RPC_URL` / `EXEC_RPC_URL`.
+
 ## Deploy the executor
 
 Deployment is a one-time operation for each executor version:
@@ -248,6 +307,12 @@ Polling alerts can be noisy. Set `TELEGRAM_POLL_ALERTS=0` to disable them withou
 | `POLL_MS` | fallback market polling interval |
 | `EVENT_POLL_MS` | provider log polling cadence |
 | `RPC_URL`, `EXEC_RPC_URL` | monitoring and execution RPC endpoints |
+| `FAST_RPC_URL` | optional local/low-latency state RPC used before `RPC_URL` |
+| `SEQUENCER_FEED`, `SEQUENCER_FEED_URL` | enable/configure Nitro sequencer feed triggers |
+| `SEQUENCER_TRIGGER_MIN_MS` | minimum interval between feed-triggered arb scans |
+| `SEQUENCER_LIVE_MAX_AGE_MS` | reject stale feed backlog as a trading trigger |
+| `SEQUENCER_FILTER_MODE` | `targets` for decoded arb-venue traffic only, `all` for every live batch |
+| `LATENCY_LOG` | JSONL output for feed/scan/opportunity timing |
 | `SCAN_RPC_URL` | optional scanner-specific RPC |
 | `SCAN_INTERVAL_MS` | PM2 scanner interval; default `1800000` (30 minutes) |
 | `SCAN_RETRY_MS` | retry delay after a failed scheduled scan |
@@ -272,7 +337,10 @@ npm audit
 
 | Path | Purpose |
 |---|---|
-| `arb.js` | market quoting, event handling, serialized live execution |
+| `arb.js` | market quoting, sequencer/event triggering, serialized live execution |
+| `sequencer-feed.js` | reconnecting Nitro sequencer feed client |
+| `sequencer-codec.js` | hot-path Nitro batch/RLP transaction decoder |
+| `latency.js` | JSONL fast-path latency recorder |
 | `risk.js` | configuration validation, gas policy, grid sizing, serialization |
 | `scanner.js` | incremental on-chain market discovery and watchlist generation |
 | `scanner-daemon.js` | scheduled scanner process used by PM2 |
