@@ -99,9 +99,34 @@ export async function buildExactStateChecks({
     { target: stateView, callData: STATE_I.encodeFunctionData('getLiquidity', [poolId]), gasLimit: 120_000 },
   ];
 
-  const raw = await Promise.all(calls.map(c =>
-    provider.call({ to: c.target, data: c.callData }, anchorBlock)
-  ));
+  let raw;
+  if (arguments[0].rpcUrl) {
+    const blockTag = '0x' + BigInt(anchorBlock).toString(16);
+    const payload = calls.map((c, i) => ({
+      jsonrpc: '2.0',
+      id: i + 1,
+      method: 'eth_call',
+      params: [{ to: c.target, data: c.callData }, blockTag],
+    }));
+    const response = await fetch(arguments[0].rpcUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const values = await response.json();
+    const byId = new Map(values.map(x => [x.id, x]));
+    raw = calls.map((_, i) => {
+      const item = byId.get(i + 1);
+      if (!item || item.error || typeof item.result !== 'string') {
+        throw new Error('state-check batch call failed');
+      }
+      return item.result;
+    });
+  } else {
+    raw = await Promise.all(calls.map(c =>
+      provider.send('eth_call', [{ to: c.target, data: c.callData }, '0x' + BigInt(anchorBlock).toString(16)])
+    ));
+  }
 
   return calls.map((c, i) => ({
     mode: 0,
