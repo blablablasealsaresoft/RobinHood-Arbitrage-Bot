@@ -74,7 +74,7 @@ const CFG = {
   curveAdapter: process.env.ROBIN_FUN_WETH_ADAPTER || null,
   v4Adapter: process.env.UNISWAP_V4_WETH_ADAPTER || null,
   flashGasUnits: BigInt(envInteger('FLASH_GAS_UNITS', 1500000, { min: 300000, max: 5000000 })),
-  flashBlockWindow: envInteger('FLASH_BLOCK_WINDOW', 1, { min: 1, max: 16 }),
+  flashBlockWindow: envInteger('FLASH_BLOCK_WINDOW', 2, { min: 1, max: 16 }),
   flashDeadlineSeconds: envInteger('FLASH_DEADLINE_SECONDS', 5, { min: 1, max: 60 }),
   sequencerMaxBlockLag: envInteger('SEQUENCER_MAX_BLOCK_LAG', 8, { min: 0, max: 1000 }),
   submitRpcUrl: process.env.SUBMIT_RPC_URL || (process.env.DIRECT_SEQUENCER_SUBMIT === '1'
@@ -334,9 +334,9 @@ async function main() {
       intent,
     });
 
-    const submitAt = Date.now();
     let txHash;
     let receipt;
+    const submitStartedAt = Date.now();
     if (submitProvider) {
       const request = await flashExecutor.executeFlashArb.populateTransaction(
         intent, legs, checks, signature, b.txOverrides,
@@ -345,12 +345,11 @@ async function main() {
       request.chainId = 4663;
       const raw = await execWallet.signTransaction(request);
       txHash = await submitProvider.send('eth_sendRawTransaction', [raw]);
-      receipt = await execProvider.waitForTransaction(txHash);
     } else {
       const tx = await flashExecutor.executeFlashArb(intent, legs, checks, signature, b.txOverrides);
       txHash = tx.hash;
-      receipt = await tx.wait();
     }
+    const submittedAt = Date.now();
     latency.record('flash-submitted', {
       triggerTxHash: sequencerContext.triggerTxHash,
       targetBlock: targetBlock.toString(),
@@ -359,14 +358,16 @@ async function main() {
       direction: b.dir,
       txHash,
       directSequencer: Boolean(submitProvider),
-      feedToSubmitMs: sequencerContext.receivedAt ? submitAt - sequencerContext.receivedAt : null,
+      feedToSubmitMs: sequencerContext.receivedAt ? submittedAt - sequencerContext.receivedAt : null,
+      submitCallMs: submittedAt - submitStartedAt,
       borrowWei: b.size.toString(),
       minProfitWei: minProfit.toString(),
     });
+    receipt = await execProvider.waitForTransaction(txHash);
     latency.record('flash-confirmed', {
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber,
-      submitToConfirmMs: Date.now() - submitAt,
+      submitToConfirmMs: Date.now() - submittedAt,
     });
     console.log('  flash tx', receipt.hash || txHash);
     notifyAtomic({
@@ -561,7 +562,7 @@ async function main() {
   try { provider.on({ address: V4.poolManager, topics: [initTopic] }, (log) => onNewPool(log)); }
   catch (e) { console.log('init sub failed:', e?.message); }
 
-  const mode = `${CFG.live ? 'LIVE' : 'DRY-RUN'}/${executor ? 'ATOMIC' : 'MONITOR'}`;
+  const mode = `${CFG.live ? 'LIVE' : 'DRY-RUN'}/${CFG.flashMode ? 'SEQUENCER-FLASH' : (executor ? 'ATOMIC' : 'MONITOR')}`;
   console.log('telegram:', tgEnabled ? 'ON' : 'off');
   await notifyStartup(mode, markets);
   await tick('boot');
