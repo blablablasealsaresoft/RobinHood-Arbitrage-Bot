@@ -194,3 +194,8 @@ volume and passing unit tests are not substitutes for these gates.
 - Standard feed structure and L1-vs-L2 numbering:
   https://docs.arbitrum.io/run-arbitrum-node/sequencer/read-sequencer-feed
 - Foundry cheatcode reference: https://getfoundry.sh/reference/cheatcodes/
+
+
+## Bounded V4 window increment
+
+See [V4_TICK_WINDOWS.md](V4_TICK_WINDOWS.md) for the opt-in scope, historical bitmap evidence, compiled-Go-to-JS synthetic window bridge and outstanding aggregate-lens deployment/gas/parity requirements. Full EVM validation includes all test contracts; a source-only or offline pass must not be counted as a lens compilation or EVM pass.

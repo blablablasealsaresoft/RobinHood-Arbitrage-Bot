@@ -77,7 +77,7 @@ def install(root: Path, check_only: bool = False) -> dict:
     output = {SOURCE: changed}
     # Copy the standalone standard-library package into the existing Nitro
     # module, without its independent go.mod or test fixtures.
-    for name in ("config.go", "capture.go", "server.go"):
+    for name in ("config.go", "capture.go", "server.go", "window.go"):
         output[Path("execution/nativebridge") / name] = (here / name).read_bytes()
     output[Path("execution/gethexec/nativearbexport.go")] = (here / "templates/nativearbexport.go.txt").read_bytes()
     output[Path("execution/gethexec/nativearbexport_other.go")] = (here / "templates/nativearbexport_other.go.txt").read_bytes()

@@ -76,6 +76,9 @@ class InstallerTests(unittest.TestCase):
                 report = installer.install(root)
                 self.assertEqual(target.read_text(), installer.transform(FIXTURE))
                 self.assertFalse(report["nitroBuildExecuted"])
+                self.assertTrue((root / "execution/nativebridge/window.go").is_file())
+                adapter = root / "execution/gethexec/nativearbexport.go"
+                self.assertIn("crypto.Keccak256Hash", adapter.read_text())
                 for file, expected in report["files"].items():
                     self.assertEqual(hashlib.sha256((root / file).read_bytes()).hexdigest(), expected)
 

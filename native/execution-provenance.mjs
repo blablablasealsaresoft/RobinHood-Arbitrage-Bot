@@ -30,6 +30,8 @@ export function validateExecutionManifest(raw, config, book) {
     const pool = book.pools.get(p.id);
     if (!pool || seen.has(p.id) || pool.kind !== p.kind || pool.pair !== address(p.address)) throw new Error('execution pool identity mismatch');
     if (p.kind === 'v4' && hash32(p.poolKeyHash) !== pool.poolKeyHash) throw new Error('execution V4 pool key mismatch');
+    if (Boolean(p.tickWindow) !== Boolean(pool.tickWindow)) throw new Error('execution tick-window coverage mismatch');
+    if (pool.tickWindow && (p.tickWindow.tickSpacing !== pool.tickWindow.tickSpacing || p.tickWindow.minWord !== pool.tickWindow.minWord || p.tickWindow.maxWord !== pool.tickWindow.maxWord)) throw new Error('execution tick-window bounds mismatch');
     seen.add(p.id);
   }
   const consumerPins = mapPins(config.codeHashes), producerPins = mapPins(manifest.codeHashes);
@@ -37,6 +39,7 @@ export function validateExecutionManifest(raw, config, book) {
   // checks, not just in a potentially obsolete startup RPC check.
   if (!consumerPins.size || producerPins.size !== consumerPins.size) throw new Error('execution code-pin coverage mismatch');
   for (const [a, h] of consumerPins) if (producerPins.get(a) !== h) throw new Error('execution runtime-code pin mismatch');
+  for (const pool of book.pools.values()) if (pool.tickWindow && !producerPins.has(pool.tickWindow.lens)) throw new Error('execution tick lens missing code pin');
   const budget = manifest.gasBudget;
   if (!budget || budget.wrappedNativeReviewed !== true) throw new Error('reviewed WETH maximum-gas policy required');
   const token = address(budget.settlementToken);

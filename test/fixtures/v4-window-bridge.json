@@ -1,0 +1,221 @@
+{
+  "synthetic": true,
+  "warning": "OFFLINE ONLY: synthetic state, identities, budgets, prices, and hashes; not a live manifest.",
+  "exporterConfig": {
+    "schema": 1,
+    "chainId": 4663,
+    "nitroRevision": "a618155919315241665356fe60f3cd00d66d5e46",
+    "socketPath": "/synthetic/never-live.sock",
+    "relayer": "0x0000000000000000000000000000000000000063",
+    "receiptFeeModel": "gasUsed-times-effectiveGasPrice-inclusive",
+    "codeHashes": {
+      "0x000000000000000000000000000000000000000a": "0x000000000000000000000000000000000000000000000000000000000000004d",
+      "0x000000000000000000000000000000000000000b": "0x000000000000000000000000000000000000000000000000000000000000004d"
+    },
+    "guards": [],
+    "pools": [
+      {
+        "id": "window",
+        "kind": "v4",
+        "address": "0x000000000000000000000000000000000000000a",
+        "poolKeyHash": "0x3a40ceee32ae401196497c0bbb3a05bcf440b6060ea8f1083d076610159a6f21",
+        "fields": [
+          {
+            "name": "sqrtPriceX96",
+            "slot": "0x1812bac1bd5779edd1fcdd51cad86479b08082d2e761fe01b273f105d4cdd07b",
+            "offset": 0,
+            "width": 160,
+            "type": "uint"
+          },
+          {
+            "name": "tick",
+            "slot": "0x1812bac1bd5779edd1fcdd51cad86479b08082d2e761fe01b273f105d4cdd07b",
+            "offset": 160,
+            "width": 24,
+            "type": "int"
+          },
+          {
+            "name": "protocolFee",
+            "slot": "0x1812bac1bd5779edd1fcdd51cad86479b08082d2e761fe01b273f105d4cdd07b",
+            "offset": 184,
+            "width": 24,
+            "type": "uint"
+          },
+          {
+            "name": "lpFee",
+            "slot": "0x1812bac1bd5779edd1fcdd51cad86479b08082d2e761fe01b273f105d4cdd07b",
+            "offset": 208,
+            "width": 24,
+            "type": "uint"
+          },
+          {
+            "name": "liquidity",
+            "slot": "0x1812bac1bd5779edd1fcdd51cad86479b08082d2e761fe01b273f105d4cdd07e",
+            "offset": 0,
+            "width": 128,
+            "type": "uint"
+          }
+        ],
+        "tickWindow": {
+          "tickSpacing": 60,
+          "minWord": -1,
+          "maxWord": 0
+        }
+      },
+      {
+        "id": "pair",
+        "kind": "v2",
+        "address": "0x000000000000000000000000000000000000000b",
+        "fields": [
+          {
+            "name": "reserve0",
+            "slot": "0x0000000000000000000000000000000000000000000000000000000000000008",
+            "offset": 0,
+            "width": 112,
+            "type": "uint"
+          },
+          {
+            "name": "reserve1",
+            "slot": "0x0000000000000000000000000000000000000000000000000000000000000008",
+            "offset": 112,
+            "width": 112,
+            "type": "uint"
+          }
+        ]
+      }
+    ]
+  },
+  "consumerConfig": {
+    "reviewed": false,
+    "pools": [
+      {
+        "id": "window",
+        "kind": "v4",
+        "pair": "0x000000000000000000000000000000000000000a",
+        "token0": "0x0000000000000000000000000000000000000001",
+        "token1": "0x0000000000000000000000000000000000000002",
+        "wrappedNativeToken": "0x0000000000000000000000000000000000000001",
+        "feePips": "600",
+        "adapter": "0x0000000000000000000000000000000000000014",
+        "adapterData": "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000258000000000000000000000000000000000000000000000000000000000000003c0000000000000000000000000000000000000000000000000000000000000000",
+        "poolKeyHash": "0x3a40ceee32ae401196497c0bbb3a05bcf440b6060ea8f1083d076610159a6f21",
+        "hooks": "0x0000000000000000000000000000000000000000",
+        "stateView": "0x000000000000000000000000000000000000001f",
+        "tickWindow": {
+          "tickSpacing": 60,
+          "minWord": -1,
+          "maxWord": 0,
+          "lens": "0x000000000000000000000000000000000000001e"
+        }
+      },
+      {
+        "id": "pair",
+        "kind": "v2",
+        "pair": "0x000000000000000000000000000000000000000b",
+        "token0": "0x0000000000000000000000000000000000000002",
+        "token1": "0x0000000000000000000000000000000000000001",
+        "adapter": "0x0000000000000000000000000000000000000015",
+        "feeNumerator": "997",
+        "feeDenominator": "1000"
+      }
+    ],
+    "routes": [
+      {
+        "id": "synthetic-window-loop",
+        "settlementToken": "0x0000000000000000000000000000000000000001",
+        "minInput": "10",
+        "maxInput": "1000",
+        "borrowCap": "1000",
+        "slippageBps": 0,
+        "minProfit": "0",
+        "legs": [
+          {
+            "poolId": "window",
+            "tokenIn": "0x0000000000000000000000000000000000000001",
+            "tokenOut": "0x0000000000000000000000000000000000000002"
+          },
+          {
+            "poolId": "pair",
+            "tokenIn": "0x0000000000000000000000000000000000000002",
+            "tokenOut": "0x0000000000000000000000000000000000000001"
+          }
+        ]
+      }
+    ],
+    "costs": [
+      {
+        "settlementToken": "0x0000000000000000000000000000000000000001",
+        "settlementUnitsPerWeiNumerator": "1",
+        "settlementUnitsPerWeiDenominator": "1",
+        "validUntilBlock": "105",
+        "successGasWei": "0",
+        "revertGasWei": "0",
+        "loseRaceBps": "0"
+      }
+    ]
+  },
+  "mappings": [
+    {
+      "key": "0x3a40ceee32ae401196497c0bbb3a05bcf440b6060ea8f1083d076610159a6f21",
+      "base": "0x0000000000000000000000000000000000000000000000000000000000000006",
+      "slot": "0x1812bac1bd5779edd1fcdd51cad86479b08082d2e761fe01b273f105d4cdd07b"
+    },
+    {
+      "key": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "base": "0x1812bac1bd5779edd1fcdd51cad86479b08082d2e761fe01b273f105d4cdd080",
+      "slot": "0xf216f4e403c5bc794291c712ac1b322692341816c38a44626ae541ee0596d94d"
+    },
+    {
+      "key": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "base": "0x1812bac1bd5779edd1fcdd51cad86479b08082d2e761fe01b273f105d4cdd080",
+      "slot": "0xebb70f2b513c6b0390aecbb456d2fac27197f58eee58fed8ef4969b8f3a9003d"
+    },
+    {
+      "key": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff88",
+      "base": "0x1812bac1bd5779edd1fcdd51cad86479b08082d2e761fe01b273f105d4cdd07f",
+      "slot": "0xab2135161b5b4d5a152dd161d932fe2ecc44b13413efdc36587b9e1d77a796c5"
+    },
+    {
+      "key": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc4",
+      "base": "0x1812bac1bd5779edd1fcdd51cad86479b08082d2e761fe01b273f105d4cdd07f",
+      "slot": "0x43fe401064f3babbd9526ee90512c509fc9b9bd17266c48bf4961ae0e9241240"
+    }
+  ],
+  "slots": [
+    {
+      "address": "0x000000000000000000000000000000000000000a",
+      "slot": "0x1812bac1bd5779edd1fcdd51cad86479b08082d2e761fe01b273f105d4cdd07b",
+      "value": "0x0000000002580000000000000000000000000001000000000000000000000000"
+    },
+    {
+      "address": "0x000000000000000000000000000000000000000a",
+      "slot": "0x1812bac1bd5779edd1fcdd51cad86479b08082d2e761fe01b273f105d4cdd07e",
+      "value": "0x0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "address": "0x000000000000000000000000000000000000000b",
+      "slot": "0x0000000000000000000000000000000000000000000000000000000000000008",
+      "value": "0x00000000000000000000000000003d648d80000000000000000000003b9aca00"
+    },
+    {
+      "address": "0x000000000000000000000000000000000000000a",
+      "slot": "0xf216f4e403c5bc794291c712ac1b322692341816c38a44626ae541ee0596d94d",
+      "value": "0xc000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "address": "0x000000000000000000000000000000000000000a",
+      "slot": "0xebb70f2b513c6b0390aecbb456d2fac27197f58eee58fed8ef4969b8f3a9003d",
+      "value": "0x0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "address": "0x000000000000000000000000000000000000000a",
+      "slot": "0xab2135161b5b4d5a152dd161d932fe2ecc44b13413efdc36587b9e1d77a796c5",
+      "value": "0x0000000000000000000000003b9aca000000000000000000000000003b9aca00"
+    },
+    {
+      "address": "0x000000000000000000000000000000000000000a",
+      "slot": "0x43fe401064f3babbd9526ee90512c509fc9b9bd17266c48bf4961ae0e9241240",
+      "value": "0xffffffffffffffffffffffffc46536000000000000000000000000003b9aca00"
+    }
+  ]
+}

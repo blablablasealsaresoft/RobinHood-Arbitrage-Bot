@@ -18,12 +18,27 @@ export const REPOSITORY_V4_ABI = [
 const execI = new Interface(REPOSITORY_V4_ABI);
 const v3I = new Interface(['function slot0() view returns (uint160,int24,uint16,uint16,uint16,uint8,bool)', 'function liquidity() view returns (uint128)']);
 const v4I = new Interface(['function getSlot0(bytes32) view returns (uint160,int24,uint24,uint24)', 'function getLiquidity(bytes32) view returns (uint128)']);
+const windowI = new Interface(['function hashV4State(bytes32 poolId,int16 minWord,uint16 wordCount,int24[] ticks) view returns (bytes32)']);
+export function hashV4WindowState(p) {
+  if (!p.tickBook || !p.tickWindow || keccak256(p.adapterData) !== p.poolKeyHash) throw new Error('V4 window/PoolKey identity mismatch');
+  const packed = p.sqrtPriceX96 | (BigInt.asUintN(24, BigInt(p.tick)) << 160n) | (p.protocolFee << 184n) | (p.lpFee << 208n);
+  const ticks = p.tickBook.ticks.map(t => t.tick);
+  const tickData = p.tickBook.ticks.map(t => t.liquidityGross | (BigInt.asUintN(128, t.liquidityNet) << 128n));
+  return keccak256(coder.encode(['bytes32','uint256','uint256','int16','uint256[]','int24[]','uint256[]'],
+    [p.poolKeyHash, packed, p.liquidity, p.tickBook.minWord, p.tickBook.words, ticks, tickData]));
+}
 const generic = (target, callData, returnData) => ({ mode: 0, target, callData, expectedReturnHash: keccak256(returnData) });
 
 export function stateChecks(pools) {
   return pools.flatMap(p => {
     if (p.kind === 'v2') return [{ mode: 1, target: p.pair, callData: '0x0902f1ac',
       expectedReturnHash: keccak256(coder.encode(['uint112', 'uint112'], [p.reserve0, p.reserve1])) }];
+    if (p.kind === 'v4' && p.tickWindow) {
+      const digest = hashV4WindowState(p);
+      return [generic(p.tickWindow.lens,
+        windowI.encodeFunctionData('hashV4State', [p.poolKeyHash, p.tickBook.minWord, p.tickBook.words.length, p.tickBook.ticks.map(t => t.tick)]),
+        coder.encode(['bytes32'], [digest]))];
+    }
     if (p.kind === 'v3') return [
       generic(p.pair, v3I.encodeFunctionData('slot0'), v3I.encodeFunctionResult('slot0', [p.sqrtPriceX96, p.tick,
         p.observationIndex, p.observationCardinality, p.observationCardinalityNext, p.feeProtocol, p.unlocked])),

@@ -160,6 +160,13 @@ func (m *Manifest) Capture(h Head, r Reader, receipts []Receipt) (*Batch, error)
 			}
 			update[f.Name] = value
 		}
+		if p.window != nil {
+			w, err := captureWindow(p, r, read)
+			if err != nil {
+				return nil, err
+			}
+			update["tickWindow"] = w
+		}
 		frame.Updates = append(frame.Updates, update)
 	}
 	snapshot, e := line(frame)

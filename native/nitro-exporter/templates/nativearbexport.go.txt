@@ -14,6 +14,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 
 	nativebridge "github.com/offchainlabs/nitro/execution/nativebridge"
@@ -33,6 +34,9 @@ func (r nativeArbStateReader) CodeHash(a nativebridge.Address) (nativebridge.Wor
 func (r nativeArbStateReader) Storage(a nativebridge.Address, w nativebridge.Word) (nativebridge.Word, error) {
 	value := r.db.GetState(common.Address(a), common.Hash(w))
 	return nativebridge.Word(value), r.db.Error()
+}
+func (r nativeArbStateReader) MappingSlot(key nativebridge.Word, base nativebridge.Word) nativebridge.Word {
+    return nativebridge.Word(crypto.Keccak256Hash(key[:], base[:]))
 }
 func (s *ExecutionEngine) nativeArbExportBlock(block *types.Block, receipts types.Receipts) {
 	x := &s.nativeArbExport

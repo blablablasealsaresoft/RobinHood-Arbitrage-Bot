@@ -10,7 +10,9 @@ export class RawBroadcaster {
   constructor(endpoints, { timeoutMs = 250, maxResponseBytes = 65_536, record = () => {} } = {}) {
     if (!Array.isArray(endpoints) || !endpoints.length || endpoints.length > 8) throw new Error('1..8 submission paths required');
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('positive timeout required');
+    if (!Number.isSafeInteger(maxResponseBytes) || maxResponseBytes < 1 || maxResponseBytes > 1_048_576) throw new Error('bounded response size required');
     this.timeoutMs = timeoutMs; this.maxResponseBytes = maxResponseBytes; this.record = record;
+    this.closed = false; this.requests = new Set();
     this.paths = endpoints.map((endpoint, index) => {
       const url = new URL(endpoint);
       if (!['https:', 'http:'].includes(url.protocol)) throw new Error('HTTP(S) endpoint required');
@@ -19,11 +21,12 @@ export class RawBroadcaster {
       return { id: `path-${index}`, url, client, agent: new client.Agent({ keepAlive: true, maxSockets: 2, maxFreeSockets: 2 }) };
     });
   }
-  #post(p, payload) {
+  #post(p, payload, { fresh = () => true, onPost = () => {} } = {}) {
+    if (this.closed) return Promise.reject(new Error('broadcaster closed'));
     return new Promise((resolve, reject) => {
       let settled = false, timer;
       const finish = (error, result) => {
-        if (settled) return; settled = true; clearTimeout(timer);
+        if (settled) return; settled = true; clearTimeout(timer); this.requests.delete(req);
         if (error) reject(error); else resolve(result);
       };
       const req = p.client.request(p.url, { method: 'POST', agent: p.agent,
@@ -46,8 +49,21 @@ export class RawBroadcaster {
         });
       });
       timer = setTimeout(() => { const error = new Error('submission deadline exceeded'); finish(error); req.destroy(error); }, this.timeoutMs);
+      this.requests.add(req);
       req.on('error', error => finish(error));
-      req.end(payload);
+      req.once('socket', socket => {
+        const send = () => {
+          if (settled) return;
+          try {
+            // http.Agent may queue a request behind busy persistent sockets.
+            // Do not buffer signed bytes before the last freshness check.
+            if (this.closed || !fresh()) throw new Error('opportunity obsolete at socket dispatch');
+            onPost(); req.end(payload);
+          } catch (error) { finish(error); req.destroy(error); }
+        };
+        if (socket.connecting) socket.once(p.url.protocol === 'https:' ? 'secureConnect' : 'connect', send);
+        else send();
+      });
     });
   }
   async warm() {
@@ -56,14 +72,16 @@ export class RawBroadcaster {
     await Promise.allSettled(this.paths.map(p => this.#post(p, JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_chainId', params: [] }))));
   }
   async broadcast(raw, expectedHash, fresh = () => true) {
+    if (this.closed) throw new Error('broadcaster closed');
     if (typeof raw !== 'string' || !/^0x(?:[0-9a-fA-F]{2})+$/.test(raw)) throw new Error('signed raw bytes required');
     expectedHash = hash32(expectedHash);
     const payload = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendRawTransaction', params: [raw] });
     const attempts = this.paths.map(async p => {
       if (!fresh()) throw new Error('opportunity obsolete before dispatch');
-      const start = process.hrtime.bigint(); this.record('POST_started', { path: p.id, txHash: expectedHash });
+      const start = process.hrtime.bigint();
       try {
-        const response = await this.#post(p, payload);
+        const response = await this.#post(p, payload, { fresh,
+          onPost: () => this.record('POST_started', { path: p.id, txHash: expectedHash }) });
         // An arbitrary "already known" error is NOT proof of acceptance of our
         // expected hash. All ambiguous outcomes stay uncertain until reconciled.
         if (response.error || String(response.result).toLowerCase() !== expectedHash) throw new Error('RPC did not acknowledge expected transaction hash');
@@ -75,7 +93,11 @@ export class RawBroadcaster {
     // stay attached to every attempt, so late failures never become unhandled.
     return Promise.any(attempts);
   }
-  close() { for (const p of this.paths) p.agent.destroy(); }
+  close() {
+    this.closed = true;
+    for (const req of this.requests) req.destroy(new Error('broadcaster closed'));
+    for (const p of this.paths) p.agent.destroy();
+  }
 }
 
 export class Telemetry {
@@ -108,30 +130,65 @@ export class Telemetry {
 // another host. A crash leaves the lock/journal behind on purpose. Restart only
 // after independent latest/pending/receipt reconciliation; expiry is not nonce
 // cancellation. No key material or endpoint credentials are journaled.
+// writeSync is allowed to return a short byte count. Never sign off durability
+// until every byte and the file's fsync succeeded. Bound repeated interruptions.
+function writeAll(fd, value) {
+  const bytes = Buffer.from(value); let offset = 0, interrupts = 0;
+  if (bytes.length > 1_048_576) throw new Error('journal record exceeds byte budget');
+  while (offset < bytes.length) {
+    let count;
+    try { count = fs.writeSync(fd, bytes, offset, bytes.length - offset, null); }
+    catch (error) { if (error.code === 'EINTR' && ++interrupts <= 8) continue; throw error; }
+    if (!Number.isSafeInteger(count) || count <= 0 || count > bytes.length - offset) throw new Error('journal write made no progress');
+    offset += count;
+  }
+}
 export class RelayerJournal {
   constructor(directory, relayer) {
-    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     const name = relayer.toLowerCase();
     if (!/^0x[0-9a-f]{40}$/.test(name)) throw new Error('invalid relayer');
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const stat = fs.lstatSync(directory);
+    if (!stat.isDirectory() || (stat.mode & 0o077) || (process.getuid && stat.uid !== process.getuid())) throw new Error('private owned runtime directory required');
+    this.dirFd = fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | (fs.constants.O_NOFOLLOW ?? 0));
+    const opened = fs.fstatSync(this.dirFd);
+    if (opened.ino !== stat.ino || opened.dev !== stat.dev) { fs.closeSync(this.dirFd); throw new Error('runtime directory changed'); }
     this.lock = path.join(directory, `${name}.lock`);
     this.filename = path.join(directory, `${name}.ndjson`);
-    this.lockFd = fs.openSync(this.lock, 'wx', 0o600);
-    fs.writeSync(this.lockFd, `${process.pid}\n`); fs.fsyncSync(this.lockFd);
+    this.dirty = false; this.failed = false; this.fd = null; this.lockFd = null;
+    let createdFile = false;
     try {
-      if (fs.existsSync(this.filename) && fs.statSync(this.filename).size > 0) throw new Error('existing nonce journal requires operator reconciliation/archive');
-      this.fd = fs.openSync(this.filename, 'ax', 0o600);
-    } catch (error) { fs.closeSync(this.lockFd); fs.unlinkSync(this.lock); throw error; }
-    this.dirty = false;
+      this.lockFd = fs.openSync(this.lock, 'wx', 0o600);
+      writeAll(this.lockFd, `${process.pid}\n`); fs.fsyncSync(this.lockFd);
+      if (fs.existsSync(this.filename)) throw new Error('existing nonce journal requires operator reconciliation/archive');
+      this.fd = fs.openSync(this.filename, 'wx', 0o600); createdFile = true;
+      fs.fsyncSync(this.fd); fs.fsyncSync(this.dirFd);
+    } catch (error) {
+      if (this.fd !== null) { fs.closeSync(this.fd); this.fd = null; }
+      if (createdFile) fs.unlinkSync(this.filename);
+      // Never remove another writer's pre-existing lock.
+      if (this.lockFd !== null) { fs.closeSync(this.lockFd); fs.unlinkSync(this.lock); }
+      fs.closeSync(this.dirFd); this.dirFd = null; throw error;
+    }
   }
   append(entry) {
+    if (this.fd === null) throw new Error('journal closed');
+    if (this.failed) throw new Error('journal failed; reconciliation required');
     this.dirty = true;
-    fs.writeSync(this.fd, stable({ wallMs: Date.now(), ...entry }) + '\n');
-    fs.fsyncSync(this.fd); // Explicit durability/latency trade-off; measured stage.
+    try {
+      writeAll(this.fd, stable({ wallMs: Date.now(), ...entry }) + '\n');
+      fs.fsyncSync(this.fd); // Explicit durability/latency trade-off; measured stage.
+    } catch (error) { this.failed = true; throw error; }
   }
   close() {
-    if (this.fd == null) return;
-    fs.closeSync(this.fd); fs.closeSync(this.lockFd); this.fd = null;
-    if (!this.dirty) { fs.unlinkSync(this.lock); fs.unlinkSync(this.filename); }
-    // Any signed/broadcast history retains the interlock, even after clean exit.
+    if (this.fd === null) return;
+    const fd = this.fd; this.fd = null;
+    try {
+      fs.closeSync(fd); fs.closeSync(this.lockFd);
+      if (!this.dirty && !this.failed) {
+        fs.unlinkSync(this.filename); fs.unlinkSync(this.lock); fs.fsyncSync(this.dirFd);
+      }
+    } finally { fs.closeSync(this.dirFd); this.dirFd = null; }
+    // Any signed/broadcast history or failed persistence retains the interlock.
   }
 }

@@ -13,6 +13,7 @@ const bridgeStages=[
   ['exporter-go-tests','go',['-C','native/nitro-exporter','test','-race','-json','-count=1','./...']],
   ['exporter-installer-tests','python3',['-m','unittest','discover','-s','native/nitro-exporter','-p','install_test.py','-v']],
   ['synthetic-bridge-integration',process.execPath,['scripts/test-nitro-bridge.mjs']],
+  ['synthetic-v4-window-bridge',process.execPath,['scripts/test-v4-window-bridge.mjs']],
 ];
 const stages=offline?[
   ['offline-tests',process.execPath,['--test',...unitFiles]],
@@ -20,7 +21,7 @@ const stages=offline?[
   ['synthetic-core-benchmark',process.execPath,['native/benchmark.mjs','10000']],
 ]:[
   ['repository-check','npm',['run','check']],
-  ['executor-evm','forge',['test','--match-contract','ExecutorV4Test','-vv']],
+  ['executor-evm','forge',['test','-vv']],
   ...bridgeStages,
   ['synthetic-core-benchmark',process.execPath,['native/benchmark.mjs','10000']],
 ];

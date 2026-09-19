@@ -52,7 +52,7 @@ async function preflight(config, book, nonces, record) {
   try {
     if (BigInt(await provider.send('eth_chainId', [])) !== 4663n) throw new Error('preflight RPC is not chain 4663');
     const required = new Set([address(config.executor), address(config.morpho)]);
-    for (const p of book.pools.values()) for (const a of [p.pair, p.adapter, p.token0, p.token1, p.stateView].filter(Boolean)) required.add(a);
+    for (const p of book.pools.values()) for (const a of [p.pair, p.adapter, p.token0, p.token1, p.stateView, p.tickWindow?.lens].filter(Boolean)) required.add(a);
     const pins = new Map(Object.entries(config.codeHashes || {}).map(([a, h]) => [address(a), h.toLowerCase()]));
     await Promise.all([...required].map(async a => {
       const code = await provider.getCode(a);
@@ -66,7 +66,14 @@ async function preflight(config, book, nonces, record) {
       provider.send('eth_getTransactionCount', [signer.relayerAddress, 'pending']),
     ]);
     if (address(strategy) !== address(signer.strategyAddress) || !allowed || paused || window !== 1n || delay !== 1n || domain !== signer.domainSeparator || address(morpho) !== address(config.morpho)) throw new Error('executor configuration/domain/authorization mismatch');
-    for (const p of book.pools.values()) if (!(await executor.adapters(p.adapter))) throw new Error('adapter not approved');
+    for (const p of book.pools.values()) {
+      if (!(await executor.adapters(p.adapter))) throw new Error('adapter not approved');
+      if (p.tickWindow) {
+        if (keccak256(p.adapterData) !== p.poolKeyHash) throw new Error('V4 PoolKey hash mismatch');
+        const lens = new Contract(p.tickWindow.lens, ['function poolManager() view returns (address)'], provider);
+        if (address(await lens.poolManager()) !== p.pair) throw new Error('V4 tick lens manager mismatch');
+      }
+    }
     for (const route of book.routes.values()) if (await executor.borrowCaps(route.settlementToken) < route.maxInput) throw new Error('on-chain borrow cap below route size');
     nonces.bootstrap({ latest: BigInt(latest), pending: BigInt(pending) });
     const ledger = new SettlementLedger({ executor: config.executor, relayer: signer.relayerAddress, lossLimits: config.sessionLossLimits });
@@ -105,9 +112,31 @@ export async function run(args = process.argv.slice(2)) {
   const halt = reason => { state.halt(reason); nonces.uncertain(); record('halt', { reason }); };
   const stop = () => { interrupted = true; halt('operator shutdown'); input?.destroy(); };
   const tasks = new Set();
+  let engine, drainHandle;
+  const trackDecision = promise => {
+    const task = promise.then(result => {
+      if (!result) return;
+      opportunities++;
+      console.log(stable({ mode: opt.live ? 'submitted' : 'dry', key: result.key,
+        anchorBlock: result.head.number, route: result.route.id, amount: result.amount,
+        grossProfit: result.grossProfit, expectedNumerator: result.expectedNumerator,
+        expectedDenominator: result.expectedDenominator, txHash: result.hash ?? null }));
+    }).catch(error => { failures++; halt(error.message); console.error(`native: ${error.message}`); });
+    tasks.add(task);
+    void task.finally(() => { tasks.delete(task); scheduleDrain(); });
+  };
+  const scheduleDrain = () => {
+    if (interrupted || drainHandle || !engine?.hasPendingDecision || engine.working || !state.healthy() || (opt.live && !nonces.available())) return;
+    // A single event-loop callback lets a buffered state+receipt group finish
+    // ingestion first. There is no unbounded queue of obsolete block decisions.
+    drainHandle = setImmediate(() => {
+      drainHandle = null;
+      if (!interrupted && state.healthy()) trackDecision(engine.drainPending());
+    });
+  };
   try {
     live = opt.live ? await preflight(config, book, nonces, record) : null;
-    const engine = new NativeEngine({ book, state, costs, nonces, live: opt.live, record,
+    engine = new NativeEngine({ book, state, costs, nonces, live: opt.live, record,
       wire: live?.wire, broadcaster: live?.broadcaster,
       beforeSend: entry => { live.journal.append({ type: 'signed', ...entry }); record('journal_persisted', { key: entry.key }); },
       beforeDispatch: (entry, opportunity) => {
@@ -137,6 +166,7 @@ export async function run(args = process.argv.slice(2)) {
         const result = live.ledger.settle(decoded, (number, hash) => state.blocks.get(number.toString()) === hash);
         if (result) {
           nonces.included(result.nonce, result.txHash);
+          scheduleDrain();
           live.journal.append({ type: 'receipt', ...result });
           record('included', { nonce: result.nonce.toString(), txHash: result.txHash, executionBlock: result.blockNumber.toString(), status: result.status });
           record('realized_pnl', result);
@@ -153,21 +183,13 @@ export async function run(args = process.argv.slice(2)) {
       }
       // Do not await signing here: a newer block must immediately invalidate an
       // in-flight older signature. NativeEngine serializes decisions, not state.
-      const task = engine.onFrame(frame).then(result => {
-        if (!result) return;
-        opportunities++;
-        console.log(stable({ mode: opt.live ? 'submitted' : 'dry', key: result.key,
-          anchorBlock: result.head.number, route: result.route.id, amount: result.amount,
-          grossProfit: result.grossProfit, expectedNumerator: result.expectedNumerator,
-          expectedDenominator: result.expectedDenominator, txHash: result.hash ?? null }));
-      }).catch(error => { failures++; halt(error.message); console.error(`native: ${error.message}`); });
-      tasks.add(task); void task.finally(() => tasks.delete(task));
+      trackDecision(engine.onFrame(frame));
     }
     halt('execution stream closed');
     await Promise.allSettled(tasks);
     return { mode: opt.live ? 'live' : 'dry', opportunities, failures, interrupted, ...(live ? { accounting: live.ledger.summary() } : {}) };
   } finally {
-    halt('runner stopped'); clearInterval(timer); input?.destroy();
+    halt('runner stopped'); clearInterval(timer); clearImmediate(drainHandle); input?.destroy();
     process.off('SIGINT', stop); process.off('SIGTERM', stop);
     await Promise.allSettled(tasks);
     live?.broadcaster.close(); live?.journal.close(); await telemetry.close();

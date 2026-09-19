@@ -1,3 +1,5 @@
+> **19 September 2026 update:** Optional bounded V4 tick-window quoting, committed-state capture and an aggregate state lens are now implemented. The lens/full Nitro build and real venue execution remain unvalidated. See [V4_TICK_WINDOWS.md](V4_TICK_WINDOWS.md); older single-tick descriptions below still apply to the default path and to V3. No configuration is enabled for live trading.
+
 # Quote-free native decision engine
 
 **Draft validation build; not production-ready.** The implementation consumes

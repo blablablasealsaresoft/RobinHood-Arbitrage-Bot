@@ -73,3 +73,23 @@ test('wire exports signed limits and EIP-712 digest for receipt/risk matching', 
   assert.equal(signed.intentDigest,TypedDataEncoder.hash(intentDomain(executor),FLASH_INTENT_TYPES,signed.intent));
   assert.equal(signed.gasLimit,800000n);assert.equal(signed.maxFeePerGas,100n);
 });
+
+test('V4 window state check matches independent ABI/Keccak golden vector', async () => {
+  const { compileTickWindow } = await import('../native/v4-ticks.mjs');
+  const { hashV4WindowState } = await import('../native/wire.mjs');
+  const v=JSON.parse(fs.readFileSync('test/fixtures/v4-window-abi-vector.json','utf8'));
+  const p={kind:'v4',poolKeyHash:v.poolId,adapterData:v.adapterData,sqrtPriceX96:1n<<96n,tick:0,liquidity:1000n,protocolFee:0n,lpFee:600n,
+    tickWindow:{tickSpacing:60,minWord:-1,maxWord:0,lens:'0x'+'ee'.repeat(20)}};
+  p.tickBook=compileTickWindow(p.tickWindow,{words:v.words,ticks:[{tick:-60,liquidityGross:1000n,liquidityNet:1000n},{tick:60,liquidityGross:1000n,liquidityNet:-1000n}]});
+  assert.equal(hashV4WindowState(p),v.stateDigest);
+  assert.deepEqual(stateChecks([p]),[{mode:0,target:p.tickWindow.lens,callData:v.callData,expectedReturnHash:v.expectedReturnHash}]);
+  assert.throws(()=>stateChecks([{...p,poolKeyHash:'0x'+'f'.repeat(64)}]),/identity/);
+});
+test('V4 window lens compiles and its ABI matches wire calldata',()=>{
+  const source=fs.readFileSync('contracts/V4TickStateLens.sol','utf8');
+  const output=JSON.parse(solc.compile(JSON.stringify({language:'Solidity',sources:{'Lens.sol':{content:source}},settings:{evmVersion:'paris',optimizer:{enabled:true,runs:500},outputSelection:{'*':{'*':['abi','evm.bytecode.object']}}}})));
+  assert.deepEqual((output.errors||[]).filter(e=>e.severity==='error'),[]);
+  const artifact=output.contracts['Lens.sol'].V4TickStateLens;assert.ok(artifact.evm.bytecode.object.length>0);
+  const v=JSON.parse(fs.readFileSync('test/fixtures/v4-window-abi-vector.json','utf8'));
+  assert.equal(new Interface(artifact.abi).encodeFunctionData('hashV4State',[v.poolId,-1,2,v.ticks]),v.callData);
+});

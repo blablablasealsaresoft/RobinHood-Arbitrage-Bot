@@ -69,11 +69,12 @@ type Field struct {
 	Type   string `json:"type"`
 }
 type Pool struct {
-	ID          string  `json:"id"`
-	Kind        string  `json:"kind"`
-	Address     string  `json:"address"`
-	Fields      []Field `json:"fields"`
-	PoolKeyHash string  `json:"poolKeyHash,omitempty"`
+	ID          string            `json:"id"`
+	Kind        string            `json:"kind"`
+	Address     string            `json:"address"`
+	Fields      []Field           `json:"fields"`
+	PoolKeyHash string            `json:"poolKeyHash,omitempty"`
+	TickWindow  *TickWindowConfig `json:"tickWindow,omitempty"`
 }
 type Guard struct {
 	Address string `json:"address"`
@@ -111,6 +112,8 @@ type compiledPool struct {
 	id, kind string
 	address  Address
 	fields   []compiledField
+	window   *TickWindowConfig
+	keyHash  Word
 }
 type compiledGuard struct {
 	address     Address
@@ -241,6 +244,11 @@ func LoadManifest(raw []byte) (*Manifest, error) {
 			}
 			used[w].Or(used[w], mask)
 			cp.fields = append(cp.fields, compiledField{f, w})
+		}
+		if p.TickWindow != nil {
+			if e := configureWindow(&cp, p); e != nil {
+				return nil, e
+			}
 		}
 		m.pools = append(m.pools, cp)
 	}

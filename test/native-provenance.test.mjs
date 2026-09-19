@@ -87,3 +87,32 @@ test('live socket is bound to reviewed path and owned private directory', () => 
     fs.chmodSync(dir, 0o755); assert.throws(() => assertExecutionSocket(sock, sock), /0700/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('V4 tick-window producer and consumer must agree on every coverage bound', () => {
+  const source = JSON.parse(fs.readFileSync('test/fixtures/v4-window-bridge.json', 'utf8'));
+  const prepare = () => {
+    const config = structuredClone(source.consumerConfig);
+    config.receiptFeeModel = 'gasUsed-times-effectiveGasPrice-inclusive';
+    config.wrappedNativeToken = config.routes[0].settlementToken;
+    config.transaction = { gasLimit: '100', maxFeePerGas: '10' };
+    const book = new RouteBook(config.pools, config.routes);
+    const pins = Object.fromEntries([...new Set([...book.pools.values()].flatMap(p => [p.pair, p.adapter, p.token0, p.token1, p.tickWindow?.lens].filter(Boolean)))].map((a, i) => [a, h(i + 1)]));
+    config.codeHashes = pins;
+    const manifest = { schema: 1, chainId: 4663, nitroRevision: NITRO_REVISION,
+      receiptFeeModel: config.receiptFeeModel, relayer: a(99), socketPath: '/tmp/synthetic/not-live.sock', codeHashes: pins,
+      pools: [...book.pools.values()].map(p => ({ id: p.id, kind: p.kind, address: p.pair, ...(p.poolKeyHash ? { poolKeyHash: p.poolKeyHash } : {}), ...(p.tickWindow ? { tickWindow: { tickSpacing: p.tickWindow.tickSpacing, minWord: p.tickWindow.minWord, maxWord: p.tickWindow.maxWord } } : {}) })),
+      gasBudget: { settlementToken: config.wrappedNativeToken, gasLimit: '100', maxFeePerGas: '10', loseRaceBps: 0, wrappedNativeReviewed: true } };
+    const check = () => { const raw = Buffer.from(JSON.stringify(manifest)); config.producerManifestHash = '0x' + createHash('sha256').update(raw).digest('hex'); return validateExecutionManifest(raw, config, book); };
+    return { config, book, manifest, check };
+  };
+  assert.ok(prepare().check());
+  for (const field of ['tickSpacing', 'minWord', 'maxWord']) {
+    const f = prepare(); f.manifest.pools[0].tickWindow[field]++;
+    assert.throws(f.check, /tick-window bounds/);
+  }
+  const missing = prepare(); delete missing.manifest.pools[0].tickWindow;
+  assert.throws(missing.check, /tick-window coverage/);
+  const unpinned = prepare(), lens = unpinned.book.pools.values().next().value.tickWindow.lens;
+  delete unpinned.config.codeHashes[lens]; delete unpinned.manifest.codeHashes[lens];
+  assert.throws(unpinned.check, /tick lens missing code pin/);
+});
