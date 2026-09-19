@@ -367,7 +367,7 @@ contract SequencerFlashArbExecutorV3 {
             } else if (check.mode == 1) {
                 require(
                     check.callData.length == 4 &&
-                    bytes4(check.callData) == GET_RESERVES_SELECTOR,
+                    keccak256(check.callData) == keccak256(abi.encodePacked(GET_RESERVES_SELECTOR)),
                     "bad reserves check"
                 );
                 (bool ok, bytes memory ret) = check.target.staticcall(check.callData);
