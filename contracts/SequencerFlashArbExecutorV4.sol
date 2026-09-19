@@ -92,7 +92,7 @@ abstract contract SequencerAuthV4 {
             (bool ok, bytes memory ret) = signer.staticcall(
                 abi.encodeCall(IERC1271V4.isValidSignature, (digest, sig))
             );
-            return ok && ret.length >= 32 && bytes4(ret) == ERC1271_MAGIC;
+            return ok && ret.length >= 32 && abi.decode(ret, (bytes4)) == ERC1271_MAGIC;
         }
         if (sig.length != 65) return false;
         bytes32 r;
