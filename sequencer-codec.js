@@ -1,20 +1,21 @@
 // sequencer-codec.js — minimal hot-path Nitro L2 transaction decoder.
 //
-// Robinhood's Nitro feed carries base64 l2Msg bytes. We only decode fields needed
-// to decide whether a sequenced transaction can move one of our arb venues:
-// recipient, selector, value, nonce and gas. No sender recovery or tx hashing is
-// done on the hot path.
+// Feed messages are executed soft-confirmed blocks. Decode just enough to
+// decide whether a block touched a supported market and retain calldata/hash
+// for candidate filtering. Sender recovery stays off the hot path.
+
+import { keccak256 } from 'ethers';
 
 const L2_BATCH = 3;
 const L2_SIGNED_TX = 4;
 const MAX_BATCH_DEPTH = 16;
 
 const LAYOUTS = new Map([
-  [0, [0, 2, 3, 4, 5]], // legacy
-  [1, [1, 3, 4, 5, 6]], // EIP-2930
-  [2, [1, 4, 5, 6, 7]], // EIP-1559
-  [3, [1, 4, 5, 6, 7]], // blob
-  [4, [1, 4, 5, 6, 7]], // EIP-7702
+  [0, [0, 2, 3, 4, 5]],
+  [1, [1, 3, 4, 5, 6]],
+  [2, [1, 4, 5, 6, 7]],
+  [3, [1, 4, 5, 6, 7]],
+  [4, [1, 4, 5, 6, 7]],
 ]);
 
 export function decodeFeedTransactions(frame) {
@@ -50,7 +51,6 @@ export function decodeL2Message(payload, depth = 0) {
     const tx = decodeTransaction(payload.subarray(1));
     return tx ? [tx] : [];
   }
-
   if (kind !== L2_BATCH || depth >= MAX_BATCH_DEPTH) return [];
 
   const out = [];
@@ -62,20 +62,15 @@ export function decodeL2Message(payload, depth = 0) {
 
 export function decodeTransaction(raw) {
   if (!raw?.length) return null;
+  const txHash = keccak256(raw);
   const typed = raw[0] < 0x80;
   const txType = typed ? raw[0] : 0;
   const layout = LAYOUTS.get(txType);
 
   if (!layout) {
     return {
-      raw,
-      txType,
-      to: null,
-      selector: null,
-      valueWei: '0',
-      nonce: '0',
-      gas: '0',
-      dataLength: 0,
+      txType, txHash, to: null, selector: null, dataHex: '0x',
+      valueWei: '0', nonce: '0', gas: '0', dataLength: 0,
     };
   }
 
@@ -84,14 +79,8 @@ export function decodeTransaction(raw) {
   try { fields = scanRlpList(body); }
   catch {
     return {
-      raw,
-      txType,
-      to: null,
-      selector: null,
-      valueWei: '0',
-      nonce: '0',
-      gas: '0',
-      dataLength: 0,
+      txType, txHash, to: null, selector: null, dataHex: '0x',
+      valueWei: '0', nonce: '0', gas: '0', dataLength: 0,
     };
   }
 
@@ -102,10 +91,11 @@ export function decodeTransaction(raw) {
   const data = payloadSlice(body, fields[dataIndex]);
 
   return {
-    raw,
     txType,
+    txHash,
     to: toBytes.length === 20 ? '0x' + toBytes.toString('hex') : null,
     selector: data.length >= 4 ? '0x' + data.subarray(0, 4).toString('hex') : null,
+    dataHex: '0x' + data.toString('hex'),
     valueWei: readUint(body, fields[valueIndex]).toString(),
     nonce: readUint(body, fields[nonceIndex]).toString(),
     gas: readUint(body, fields[gasIndex]).toString(),
@@ -146,27 +136,22 @@ function scanRlpList(buf) {
   const out = [];
   while (i < end) {
     const c = buf[i];
-    let itemStart = i;
+    const itemStart = i;
     let start;
     let finish;
 
     if (c < 0x80) {
-      start = i;
-      finish = i + 1;
+      start = i; finish = i + 1;
     } else if (c < 0xb8) {
-      start = i + 1;
-      finish = start + (c - 0x80);
+      start = i + 1; finish = start + (c - 0x80);
     } else if (c < 0xc0) {
       const n = c - 0xb7;
-      start = i + 1 + n;
-      finish = start + readLength(buf, i + 1, n);
+      start = i + 1 + n; finish = start + readLength(buf, i + 1, n);
     } else if (c < 0xf8) {
-      start = i + 1;
-      finish = start + (c - 0xc0);
+      start = i + 1; finish = start + (c - 0xc0);
     } else {
       const n = c - 0xf7;
-      start = i + 1 + n;
-      finish = start + readLength(buf, i + 1, n);
+      start = i + 1 + n; finish = start + readLength(buf, i + 1, n);
     }
 
     if (finish > end || finish < start) throw new Error('malformed RLP item');
@@ -185,9 +170,7 @@ function readLength(buf, start, count) {
   return value;
 }
 
-function payloadSlice(buf, item) {
-  return buf.subarray(item[1], item[2]);
-}
+function payloadSlice(buf, item) { return buf.subarray(item[1], item[2]); }
 
 function readUint(buf, item) {
   const bytes = payloadSlice(buf, item);
