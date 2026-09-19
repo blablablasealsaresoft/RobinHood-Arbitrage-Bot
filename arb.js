@@ -56,8 +56,10 @@ const CFG = {
   once: process.argv.includes('--once'),
   sequencerFeed: process.env.SEQUENCER_FEED === '1',
   sequencerTriggerMinMs: envInteger('SEQUENCER_TRIGGER_MIN_MS', 500, { min: 0, max: 60000 }),
+  sequencerFilterMode: process.env.SEQUENCER_FILTER_MODE || 'targets',
 };
 if (CFG.minSize <= 0n || CFG.maxSize < CFG.minSize) throw new Error('invalid MIN_SIZE_ETH/MAX_SIZE_ETH');
+if (!['targets','all'].includes(CFG.sequencerFilterMode)) throw new Error('SEQUENCER_FILTER_MODE must be targets or all');
 const keyTuple = (k) => [k.currency0, k.currency1, k.fee, k.tickSpacing, k.hooks];
 const ABI_CODER = AbiCoder.defaultAbiCoder();
 const ZERO = '0x0000000000000000000000000000000000000000';
@@ -125,6 +127,12 @@ async function main() {
   }
 
   let markets = validateMarkets(loadMarkets());
+  const sequencerTargets = new Set([
+    CURVE.address,
+    V4.poolManager,
+    V4.universalRouter,
+    ...markets.map((m) => m.token),
+  ].map((x) => x.toLowerCase()));
   const curve = new Contract(CURVE.address, CURVE_ABI, runner);
   const quoter = new Contract(V4.quoter, QUOTER_ABI, provider);
   const executor = CFG.executor && execWallet ? new Contract(CFG.executor, EXECUTOR_ABI, execWallet) : null;
@@ -266,10 +274,30 @@ async function main() {
   if (CFG.sequencerFeed && !CFG.once) {
     sequencerFeed = new SequencerFeedClient({
       onBatch: (batch) => {
-        latency.record('feed', { sequenceNumber: batch.lastSequenceNumber, messageCount: batch.messageCount, frameBytes: batch.frameBytes });
+        const matched = batch.transactions.filter((tx) => tx.to && sequencerTargets.has(tx.to.toLowerCase()));
+        latency.record('feed', {
+          sequenceNumber: batch.lastSequenceNumber,
+          messageCount: batch.messageCount,
+          transactionCount: batch.transactions.length,
+          matchedCount: matched.length,
+          live: batch.live,
+          messageAgeMs: batch.messageAgeMs,
+          frameBytes: batch.frameBytes,
+        });
+        if (!batch.live) return;
+        if (CFG.sequencerFilterMode === 'targets' && matched.length === 0) return;
         const now = Date.now();
         if (now - lastSequencerTriggerAt < CFG.sequencerTriggerMinMs) return;
         lastSequencerTriggerAt = now;
+        latency.record('trigger', {
+          sequenceNumber: batch.lastSequenceNumber,
+          matched: matched.slice(0, 8).map((tx) => ({
+            to: tx.to,
+            selector: tx.selector,
+            valueWei: tx.valueWei,
+            txType: tx.txType,
+          })),
+        });
         tick('sequencer').catch((e) => console.error('sequencer tick:', e));
       },
       onStatus: (status) => {
@@ -334,6 +362,7 @@ async function main() {
         if (!m.pools.some((p) => p.id.toLowerCase() === poolIdLc)) m.pools.push(pool);
       } else {
         m = { token: c1, symbol: sym, pools: [pool] }; markets.push(m);
+        sequencerTargets.add(c1.toLowerCase());
       }
       provider.on({ address: V4.poolManager, topics: [swapTopic, poolId] }, () => tick('swap').catch(e => console.error('tick:', e)));
       persistWatchlist();
