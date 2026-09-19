@@ -87,6 +87,7 @@ export function buildLegs({
 
 export async function buildExactStateChecks({
   provider,
+  rpcUrl,
   anchorBlock,
   curve,
   stateView,
@@ -100,7 +101,7 @@ export async function buildExactStateChecks({
   ];
 
   let raw;
-  if (arguments[0].rpcUrl) {
+  if (rpcUrl) {
     const blockTag = '0x' + BigInt(anchorBlock).toString(16);
     const payload = calls.map((c, i) => ({
       jsonrpc: '2.0',
@@ -108,7 +109,7 @@ export async function buildExactStateChecks({
       method: 'eth_call',
       params: [{ to: c.target, data: c.callData }, blockTag],
     }));
-    const response = await fetch(arguments[0].rpcUrl, {
+    const response = await fetch(rpcUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
