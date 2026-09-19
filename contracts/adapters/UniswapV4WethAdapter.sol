@@ -52,12 +52,14 @@ contract UniswapV4WethAdapter {
     IPermit2V4Adapter public immutable permit2;
     IUniversalRouterV4Adapter public immutable router;
     mapping(bytes32 => bool) public allowedPools;
+    uint256 private unlocked = 1;
 
     event PoolAllowed(bytes32 indexed poolId, bool allowed);
     event OwnershipTransferStarted(address indexed owner, address indexed pendingOwner);
     event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
 
     modifier onlyOwner() { require(msg.sender == owner, "not owner"); _; }
+    modifier nonReentrant() { require(unlocked == 1, "reentrant"); unlocked = 2; _; unlocked = 1; }
 
     constructor(
         address initialOwner,
@@ -94,9 +96,14 @@ contract UniswapV4WethAdapter {
         uint256 amountIn,
         uint256 minOut,
         bytes calldata data
-    ) external returns (uint256 amountOut) {
+    ) external nonReentrant returns (uint256 amountOut) {
         require(amountIn > 0 && minOut > 0, "zero amount");
-        require(amountIn <= type(uint128).max && amountIn <= type(uint160).max, "amount too large");
+        require(
+            amountIn <= type(uint128).max &&
+            amountIn <= type(uint160).max &&
+            minOut <= type(uint128).max,
+            "amount too large"
+        );
         PoolKey memory key = abi.decode(data, (PoolKey));
         _validateKey(key);
         require(allowedPools[poolId(key)], "pool not allowed");
