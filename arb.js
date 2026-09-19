@@ -24,6 +24,7 @@ import { CURVE_ABI, QUOTER_ABI } from './abis.js';
 import { CURVE, V4, TOKEN, POOLS } from './config.js';
 import { notifyStartup, notifyAtomic, notifyError, notifyPoll, notifyNoMarkets, tg, tgEnabled } from './telegram.js';
 import { bpsDown, buildGrid, envInteger, feeOverrides, serialRunner } from './risk.js';
+import { SequencerFeedClient } from './sequencer-feed.js';
 
 const EXECUTOR_ABI = [
   'function curveToV4(address token,uint256 ethIn,uint256 minTokensOut,(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks) key,uint128 minEthOut,uint256 minProfit)',
@@ -52,6 +53,8 @@ const CFG = {
   executor: process.env.EXECUTOR_ADDR || null,
   watchlist: process.env.WATCHLIST === '1',
   once: process.argv.includes('--once'),
+  sequencerFeed: process.env.SEQUENCER_FEED === '1',
+  sequencerTriggerMinMs: envInteger('SEQUENCER_TRIGGER_MIN_MS', 500, { min: 0, max: 60000 }),
 };
 if (CFG.minSize <= 0n || CFG.maxSize < CFG.minSize) throw new Error('invalid MIN_SIZE_ETH/MAX_SIZE_ETH');
 const keyTuple = (k) => [k.currency0, k.currency1, k.fee, k.tickSpacing, k.hooks];
@@ -101,10 +104,10 @@ async function main() {
   // If only a private execution RPC is configured, share it for monitoring too.
   // This avoids silently falling back to the less reliable public RPC while the
   // user already has a working private endpoint.
-  const monitorRpcUrl = process.env.RPC_URL || process.env.EXEC_RPC_URL || null;
+  const monitorRpcUrl = process.env.FAST_RPC_URL || process.env.RPC_URL || process.env.EXEC_RPC_URL || null;
   const provider = await makeProvider({ rpcUrl: monitorRpcUrl });
   provider.pollingInterval = CFG.eventPollMs;
-  console.log(`monitor RPC: ${monitorRpcUrl ? (process.env.RPC_URL ? 'dedicated/private' : 'shared execution RPC') : 'pinned public'}`);
+  console.log(`monitor RPC: ${monitorRpcUrl ? (process.env.FAST_RPC_URL ? 'fast/local' : (process.env.RPC_URL ? 'dedicated/private' : 'shared execution RPC')) : 'pinned public'}`);
   const wallet = process.env.PRIVATE_KEY ? new Wallet(process.env.PRIVATE_KEY, provider) : null;
   if (CFG.live && !wallet) throw new Error('LIVE requires PRIVATE_KEY');
   if (CFG.live && !CFG.executor) throw new Error('LIVE requires EXECUTOR_ADDR; unsafe EOA mode is disabled');
@@ -253,6 +256,26 @@ async function main() {
     setImmediate(() => process.exit(1));
   });
 
+  let sequencerFeed = null;
+  let lastSequencerTriggerAt = 0;
+  if (CFG.sequencerFeed && !CFG.once) {
+    sequencerFeed = new SequencerFeedClient({
+      onBatch: (batch) => {
+        const now = Date.now();
+        if (now - lastSequencerTriggerAt < CFG.sequencerTriggerMinMs) return;
+        lastSequencerTriggerAt = now;
+        tick('sequencer').catch((e) => console.error('sequencer tick:', e));
+      },
+      onStatus: (status) => {
+        if (status.type === 'connected') console.log('sequencer feed: connected');
+        else if (status.type === 'disconnected') console.log('sequencer feed: disconnected; reconnecting');
+        else if (status.type === 'error') console.warn('sequencer feed:', status.error);
+      },
+    });
+    try { sequencerFeed.start(); }
+    catch (e) { console.warn('sequencer feed disabled:', e.message); sequencerFeed = null; }
+  }
+
   // event-driven: ONE subscription for all watched pools (topic1 = OR of poolIds)
   const swapTopic = topicId('Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)');
   const watchedIds = [...new Set(markets.flatMap(m => m.pools.map(p => p.id)))];
@@ -320,12 +343,22 @@ async function main() {
   await notifyStartup(mode, markets);
   await tick('boot');
   if (CFG.once) {
+    sequencerFeed?.stop();
     provider.removeAllListeners();
     provider.destroy();
     if (execProvider !== provider) execProvider.destroy();
     return;
   }
-  setInterval(() => tick('poll').catch(e => console.error('tick:', e)), CFG.pollMs);
+  const pollTimer = setInterval(() => tick('poll').catch(e => console.error('tick:', e)), CFG.pollMs);
+  pollTimer.unref?.();
+  for (const sig of ['SIGINT', 'SIGTERM']) process.once(sig, () => {
+    sequencerFeed?.stop();
+    clearInterval(pollTimer);
+    provider.removeAllListeners();
+    provider.destroy();
+    if (execProvider !== provider) execProvider.destroy();
+    process.exit(0);
+  });
 }
 
 main().catch(e => { console.error('FATAL', e); process.exit(1); });
