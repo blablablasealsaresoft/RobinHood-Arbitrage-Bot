@@ -356,9 +356,11 @@ async function main() {
   }
 
   let lastLog = 0;
+  let lastSequencerContext = null;
   async function tickBody(trigger = 'poll') {
     const tickStartedAt = Date.now();
-    gasPolicy = feeOverrides(await execProvider.getFeeData(), CFG.gasUnits, CFG.gasBufferBps);
+    const gasUnits = CFG.flashMode && trigger === 'sequencer' ? CFG.flashGasUnits : CFG.gasUnits;
+    gasPolicy = feeOverrides(await execProvider.getFeeData(), gasUnits, CFG.gasBufferBps);
     const all = await scanAll();
     if (!all.length) {
       if (trigger === 'poll' || trigger === 'boot') notifyNoMarkets(trigger).catch(() => {});
@@ -377,7 +379,15 @@ async function main() {
       console.log('>>> OPPORTUNITY', line);
       if (!CFG.live || !wallet) { console.log('    (idle: dry-run/no wallet)'); return; }
       try {
-        await execute(b);
+        if (CFG.flashMode) {
+          if (trigger !== 'sequencer') {
+            console.log('    (idle: sequencer flash mode only executes sequencer-triggered opportunities)');
+            return;
+          }
+          await executeFlash(b, lastSequencerContext);
+        } else {
+          await execute(b);
+        }
       } catch (e) {
         console.log('    exec FAILED:', e.shortMessage || e.message);
         notifyError(`${b.market.symbol} ${b.tag}: ${e.shortMessage || e.message}`).catch(() => {});
@@ -424,11 +434,25 @@ async function main() {
         });
         if (!batch.live) return;
         if (CFG.sequencerFilterMode === 'targets' && matched.length === 0) return;
+        if (CFG.flashMode && matched.length === 0) return;
+
+        const targetTx = matched.length ? matched[matched.length - 1] : batch.transactions[batch.transactions.length - 1];
+        const triggerTxHash = targetTx?.raw ? keccak256(targetTx.raw) : null;
+        lastSequencerContext = {
+          receivedAt: batch.receivedAt,
+          sequenceNumber: targetTx?.sequenceNumber || batch.lastSequenceNumber,
+          triggerTxHash,
+          to: targetTx?.to || null,
+          selector: targetTx?.selector || null,
+          valueWei: targetTx?.valueWei || '0',
+        };
+
         const now = Date.now();
         if (now - lastSequencerTriggerAt < CFG.sequencerTriggerMinMs) return;
         lastSequencerTriggerAt = now;
         latency.record('trigger', {
-          sequenceNumber: batch.lastSequenceNumber,
+          sequenceNumber: lastSequencerContext.sequenceNumber,
+          triggerTxHash,
           matched: matched.slice(0, 8).map((tx) => ({
             to: tx.to,
             selector: tx.selector,
