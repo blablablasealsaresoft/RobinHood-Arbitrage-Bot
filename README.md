@@ -108,6 +108,39 @@ LATENCY_LOG=./logs/sequencer-latency.jsonl
 The fast path remains serialized through the existing `serialRunner`; a burst of sequencer messages coalesces rather than launching overlapping nonce/execution work. `SEQUENCER_TRIGGER_MIN_MS` bounds quote load. `SEQUENCER_LIVE_MAX_AGE_MS` prevents replayed backlog from triggering scans. In `targets` mode, decoded feed transactions must touch the RobinFun curve, V4 router/manager, or a watched token before a sequencer scan fires. Feed, scan, and opportunity timing is written as JSONL to `LATENCY_LOG`.
 
 
+## Sequencer flash-backrun mode
+
+The optional V3 path can fund the current RobinFun <-> V4 opportunity with a Morpho Blue WETH flash loan. It remains disabled unless `SEQUENCER_FLASH_MODE=1` and all deployed addresses/signers are supplied.
+
+Current verified dependencies used by `deploy:sequencer`:
+
+- Morpho Blue: `0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010`
+- Canonical Robinhood WETH: `0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73`
+- V4 Universal Router and Permit2: the existing verified values in `config.js`
+
+Build first:
+
+```powershell
+npm test
+npm run build:contract
+```
+
+Deployment is fail-closed and requires explicit Safe owner, strategy signer and treasury:
+
+```powershell
+$env:SAFE_OWNER="0x..."
+$env:STRATEGY_SIGNER="0x..."
+$env:TREASURY="0x..."
+$env:MAX_BLOCK_WINDOW="2"
+npm run deploy:sequencer
+```
+
+Deployment does not enable a relayer, adapter, token, pool or borrow cap. Those must be reviewed and enabled through the Safe before flash mode can execute.
+
+The sequencer flash path binds each opportunity to the relevant decoded feed transaction hash, snapshots RobinFun curve state plus V4 slot0/liquidity, signs those hashes into the EIP-712 intent, then rechecks them onchain before Morpho is asked to lend. The executor requires a closed WETH route, per-leg minimum outputs, a bounded gas price, nonce freshness, a tiny block/time window, and profit both before and after Morpho pulls repayment.
+
+Set `DIRECT_SEQUENCER_SUBMIT=1` to submit the locally signed raw transaction to `https://sequencer.mainnet.chain.robinhood.com` while keeping reads and receipt tracking on `FAST_RPC_URL` / `EXEC_RPC_URL`.
+
 ## Deploy the executor
 
 Deployment is a one-time operation for each executor version:
