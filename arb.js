@@ -30,6 +30,9 @@ import { buildFlashIntent, genericStateCheck, signFlashIntent } from './flash-in
 import { DEPLOYMENTS, WETH as CANONICAL_WETH, envOrDeployed } from './deployments.js';
 import { FLASH_EXECUTOR_ABI, confirmAnchorHash, nextBlockValidity } from './l2-clock.js';
 import { feedTriggerTxHash } from './sequencer-codec.js';
+import {
+  ROUTE_QUOTER_ABI, TICK_LENS_ABI, haircutRouteQuote, tickBitmapWindow,
+} from './l2-quote.js';
 
 const EXECUTOR_ABI = [
   'function curveToV4(address token,uint256 ethIn,uint256 minTokensOut,(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks) key,uint128 minEthOut,uint256 minProfit)',
@@ -46,6 +49,7 @@ const V4_STATE = new Interface([
   'function getSlot0(bytes32 poolId) view returns (uint160 sqrtPriceX96,int24 tick,uint24 protocolFee,uint24 lpFee)',
   'function getLiquidity(bytes32 poolId) view returns (uint128 liquidity)',
 ]);
+const TICK_LENS_STATE = new Interface(TICK_LENS_ABI);
 
 const CLI_LIVE = process.argv.includes('--live');
 const CLI_DRY_RUN = process.argv.includes('--dry-run');
@@ -259,32 +263,70 @@ async function main() {
     console.log(`flash stack: executor=${CFG.flashExecutor} cap=${formatEther(cap)} WETH`);
   }
 
+  const stateView = new Contract(V4.stateView, V4_STATE.fragments, provider);
+  markets = (await Promise.all(markets.map(async (m) => ({
+    ...m,
+    pools: (await Promise.all(m.pools.map(async (p) => {
+      const liq = await stateView.getLiquidity(p.id).catch(() => 0n);
+      if (liq === 0n) {
+        console.warn(`skip ${m.symbol} ${p.name}: zero V4 liquidity`);
+        return null;
+      }
+      return p;
+    }))).filter(Boolean),
+  })))).filter((m) => m.pools.length);
+  if (!markets.length) {
+    console.warn('WARNING: no pools with active V4 liquidity; quoting idle until a liquid allowlisted pool appears');
+  }
+
+  const routeQuoter = new Contract(CFG.routeQuoter, ROUTE_QUOTER_ABI, provider);
+
   let gasPolicy = feeOverrides(await execProvider.getFeeData(), CFG.gasUnits, CFG.gasBufferBps);
   const latency = createLatencyRecorder();
 
   console.log(`\nRobinFun<->UniV4 arb | ${CFG.live ? 'LIVE' : 'DRY-RUN'} | ${CFG.flashMode ? 'SEQUENCER-FLASH' : (executor ? 'ATOMIC' : 'MONITOR')} | ${CFG.watchlist ? 'WATCHLIST' : 'single'}`);
   console.log(`wallet: ${wallet ? wallet.address : '(monitor only)'}`);
-  console.log(`markets: ${markets.map(m => `${m.symbol}(${m.pools.map(p => p.name).join('/')})`).join(', ')}`);
+  console.log(`markets: ${markets.length ? markets.map(m => `${m.symbol}(${m.pools.map(p => p.name).join('/')})`).join(', ') : '(none liquid)'}`);
   console.log(`gate >= ${CFG.minProfitBps} bps | size [${formatEther(CFG.minSize)}, ${formatEther(CFG.maxSize)}] ETH\n`);
 
   const v4Sell = (tok, key) => quoter.quoteExactInputSingle.staticCall([keyTuple(key), false, tok, '0x']).then(r => r[0]).catch(() => 0n);
   const v4Buy  = (eth, key) => quoter.quoteExactInputSingle.staticCall([keyTuple(key), true, eth, '0x']).then(r => r[0]).catch(() => 0n);
 
+  async function quotePool(direction, m, pool, ethIn) {
+    try {
+      const quoted = direction === 'A'
+        ? await routeQuoter.quoteCurveToV4.staticCall(m.token, ethIn, keyTuple(pool.key))
+        : await routeQuoter.quoteV4ToCurve.staticCall(m.token, ethIn, keyTuple(pool.key));
+      return haircutRouteQuote(quoted.tokenOut ?? quoted[0], quoted.wethOut ?? quoted[1], CFG.slippageBps);
+    } catch {
+      if (direction === 'A') {
+        const tok = await curve.quoteBuy(m.token, ethIn).catch(() => 0n);
+        if (!tok) return { tok: 0n, back: 0n };
+        return { tok, back: await v4Sell(bpsDown(tok, CFG.slippageBps), pool.key) };
+      }
+      const tok = await v4Buy(ethIn, pool.key);
+      if (!tok) return { tok: 0n, back: 0n };
+      return { tok, back: await curve.quoteSell(m.token, bpsDown(tok, CFG.slippageBps)).catch(() => 0n) };
+    }
+  }
+
+  async function bestPoolQuote(direction, m, ethIn) {
+    const quotes = await Promise.all(m.pools.map(async (pool) => {
+      const q = await quotePool(direction, m, pool, ethIn);
+      return { pool, ...q };
+    }));
+    return quotes.reduce((best, q) => (!best || q.back > best.back ? q : best), null);
+  }
+
   async function netA(m, ethIn) { // buy curve -> sell best V4 pool
-    const tok = await curve.quoteBuy(m.token, ethIn).catch(() => 0n);
-    if (!tok) return { net: -ethIn, tok: 0n, back: 0n, pool: null };
-    const conservativeTok = bpsDown(tok, CFG.slippageBps);
-    const backs = await Promise.all(m.pools.map(p => v4Sell(conservativeTok, p.key)));
-    let bi = 0; for (let i = 1; i < backs.length; i++) if (backs[i] > backs[bi]) bi = i;
-    return { net: backs[bi] - ethIn - gasPolicy.maxGasCost, tok, back: backs[bi], pool: m.pools[bi], gasCost: gasPolicy.maxGasCost, txOverrides: gasPolicy.overrides };
+    const q = await bestPoolQuote('A', m, ethIn);
+    if (!q?.tok) return { net: -ethIn, tok: 0n, back: 0n, pool: null };
+    return { net: q.back - ethIn - gasPolicy.maxGasCost, tok: q.tok, back: q.back, pool: q.pool, gasCost: gasPolicy.maxGasCost, txOverrides: gasPolicy.overrides };
   }
   async function netB(m, ethIn) { // buy best V4 pool -> sell curve
-    const toks = await Promise.all(m.pools.map(p => v4Buy(ethIn, p.key)));
-    let bi = 0; for (let i = 1; i < toks.length; i++) if (toks[i] > toks[bi]) bi = i;
-    const tok = toks[bi];
-    if (!tok) return { net: -ethIn, tok: 0n, back: 0n, pool: null };
-    const back = await curve.quoteSell(m.token, bpsDown(tok, CFG.slippageBps)).catch(() => 0n);
-    return { net: back - ethIn - gasPolicy.maxGasCost, tok, back, pool: m.pools[bi], gasCost: gasPolicy.maxGasCost, txOverrides: gasPolicy.overrides };
+    const q = await bestPoolQuote('B', m, ethIn);
+    if (!q?.tok) return { net: -ethIn, tok: 0n, back: 0n, pool: null };
+    return { net: q.back - ethIn - gasPolicy.maxGasCost, tok: q.tok, back: q.back, pool: q.pool, gasCost: gasPolicy.maxGasCost, txOverrides: gasPolicy.overrides };
   }
   // geometric grid of probe sizes — deterministic, RPC-friendly (vs ternary storms)
   const gridSizes = buildGrid(CFG.minSize, CFG.maxSize, CFG.gridPoints);
@@ -339,11 +381,22 @@ async function main() {
       provider.call({ to: V4.stateView, data: slot0Call }),
       provider.call({ to: V4.stateView, data: liquidityCall }),
     ]);
-    return [
+    const checks = [
       genericStateCheck(CURVE.address, curveCall, curveReturn),
       genericStateCheck(V4.stateView, slot0Call, slot0Return),
       genericStateCheck(V4.stateView, liquidityCall, liquidityReturn),
     ];
+    try {
+      const decoded = V4_STATE.decodeFunctionResult('getSlot0', slot0Return);
+      const tick = decoded.tick ?? decoded[1];
+      const { minWord, wordCount } = tickBitmapWindow(tick, b.pool.key.tickSpacing);
+      const lensCall = TICK_LENS_STATE.encodeFunctionData('hashV4State', [b.pool.id, minWord, wordCount, []]);
+      const lensReturn = await provider.call({ to: CFG.tickLens, data: lensCall });
+      checks.push(genericStateCheck(CFG.tickLens, lensCall, lensReturn));
+    } catch {
+      // Keep StateView locks if the lens window is unavailable.
+    }
+    return checks;
   }
 
   async function executeFlash(b, sequencerContext) {
@@ -497,7 +550,7 @@ async function main() {
   process.on('unhandledRejection', (e) => {
     const method = e?.payload?.method;
     const message = e?.shortMessage || e?.error?.message || e?.message || String(e);
-    if (method === 'eth_getLogs' || /connection refused|temporarily unavailable|timeout/i.test(message)) {
+    if (method === 'eth_getLogs' || /connection refused|temporarily unavailable|timeout|provider destroyed|cancelled request/i.test(message)) {
       console.warn('transient RPC event error (will retry):', message);
       if (Date.now() - lastTransientAlert > 300000) {
         lastTransientAlert = Date.now();
@@ -573,7 +626,7 @@ async function main() {
   // event-driven: ONE subscription for all watched pools (topic1 = OR of poolIds)
   const swapTopic = topicId('Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)');
   const watchedIds = [...new Set(markets.flatMap(m => m.pools.map(p => p.id)))];
-  if (watchedIds.length) {
+  if (!CFG.once && watchedIds.length) {
     try { provider.on({ address: V4.poolManager, topics: [swapTopic, watchedIds] }, () => tick('swap').catch(e => console.error('tick:', e))); }
     catch (e) { console.log('event sub failed, poll-only:', e?.message); }
   }
@@ -611,6 +664,11 @@ async function main() {
       const sym = await new Contract(c1, ['function symbol() view returns (string)'], provider).symbol().catch(() => '?');
       const key = { currency0: c0, currency1: c1, fee: Number(fee), tickSpacing: Number(tickSpacing), hooks };
       const pool = { name: (Number(fee) / 1e6 * 100) + '%', id: poolId, key };
+      const liq = await stateView.getLiquidity(poolId).catch(() => 0n);
+      if (liq === 0n) {
+        console.log(`NEW POOL PENDING LIQUIDITY: ${sym} @ ${pool.name} (${c1})`);
+        return;
+      }
       if (executor && !(await executor.allowedPools(poolId).catch(() => false))) {
         console.log(`NEW POOL PENDING ALLOWLIST: ${sym} @ ${pool.name} (${c1})`);
         await tg(`🛡️ <b>New pool pending approval</b>: ${sym} @ ${pool.name} — run npm run allow-pools after review`);
@@ -641,8 +699,9 @@ async function main() {
       tick('newpool').catch(e => console.error('tick:', e));
     } catch { /* ignore malformed logs */ }
   }
-  try { provider.on({ address: V4.poolManager, topics: [initTopic] }, (log) => onNewPool(log)); }
-  catch (e) { console.log('init sub failed:', e?.message); }
+  try {
+    if (!CFG.once) provider.on({ address: V4.poolManager, topics: [initTopic] }, (log) => onNewPool(log));
+  } catch (e) { console.log('init sub failed:', e?.message); }
 
   const mode = `${CFG.live ? 'LIVE' : 'DRY-RUN'}/${CFG.flashMode ? 'SEQUENCER-FLASH' : (executor ? 'ATOMIC' : 'MONITOR')}`;
   console.log('telegram:', tgEnabled ? 'ON' : 'off');
