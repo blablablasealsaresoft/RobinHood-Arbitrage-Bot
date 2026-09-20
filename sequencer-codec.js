@@ -103,6 +103,10 @@ export function decodeTransaction(raw) {
   };
 }
 
+export function feedTriggerTxHash(tx) {
+  return tx?.txHash || null;
+}
+
 function* splitBatch(payload) {
   let offset = 0;
   while (offset + 8 <= payload.length) {

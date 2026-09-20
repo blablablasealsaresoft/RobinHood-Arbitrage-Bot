@@ -27,7 +27,8 @@
     "pause": "node executor-admin.js pause",
     "unpause": "node executor-admin.js unpause",
     "sequencer:smoke": "node scripts/sequencer-smoke.js",
-    "deploy:sequencer": "node deploy-sequencer.js"
+    "deploy:sequencer": "node deploy-sequencer.js",
+    "live-status": "node scripts/live-status.js"
   },
   "dependencies": {
     "dotenv": "17.4.2",

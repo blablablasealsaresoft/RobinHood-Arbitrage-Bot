@@ -44,3 +44,29 @@ test('SequencerFlashArbExecutorV3 compiles and exposes signed flash-arb safety c
     assert.ok(names.has(name), `missing ${name}`);
   }
 });
+
+test('SequencerFlashArbExecutorV4 compiles with ArbSys L2 anchors', () => {
+  const source = fs.readFileSync(new URL('../contracts/SequencerFlashArbExecutorV4.sol', import.meta.url), 'utf8');
+  assert.match(source, /ARBSYS/);
+  assert.match(source, /arbBlockNumber/);
+  assert.doesNotMatch(source, /require\(intent\.anchorBlock < block\.number/);
+  const input = {
+    language: 'Solidity',
+    sources: { 'SequencerFlashArbExecutorV4.sol': { content: source } },
+    settings: {
+      evmVersion: 'paris',
+      viaIR: true,
+      optimizer: { enabled: true, runs: 500 },
+      outputSelection: { '*': { '*': ['abi', 'evm.bytecode.object'] } },
+    },
+  };
+  const output = JSON.parse(solc.compile(JSON.stringify(input)));
+  const errors = (output.errors || []).filter((e) => e.severity === 'error');
+  assert.deepEqual(errors, []);
+  const artifact = output.contracts['SequencerFlashArbExecutorV4.sol'].SequencerFlashArbExecutorV4;
+  assert.ok(artifact.evm.bytecode.object.length > 0);
+  const names = new Set(artifact.abi.filter((x) => x.type === 'function').map((x) => x.name));
+  for (const name of ['executeFlashArb', 'maxAnchorDelay', 'maxBlockWindow', 'relayers', 'adapters', 'borrowCaps']) {
+    assert.ok(names.has(name), `missing ${name}`);
+  }
+});

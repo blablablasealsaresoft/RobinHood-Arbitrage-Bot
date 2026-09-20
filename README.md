@@ -9,7 +9,7 @@ Atomic arbitrage between a configured RobinFun bonding-curve manager and Uniswap
 | A | buy on the curve, sell on V4 |
 | B | buy on V4, sell on the curve |
 
-Live trading requires the deployed `ArbExecutor`. Both legs execute in one transaction. The executor reverts unless its ETH balance increases by the requested gross profit floor, which includes the bot's configured net target and bounded maximum gas cost. A reverted transaction still costs gas.
+Live trading is atomic-only. The default path uses a deployed `ArbExecutor`. The live 2026-09-20 stack uses `SequencerFlashArbExecutorV4` with Morpho WETH flash loans when `SEQUENCER_FLASH_MODE=1`. Both legs execute in one transaction and revert unless profit covers the configured net floor plus bounded gas. A reverted transaction still costs gas.
 
 This software does not guarantee profit. It is designed to reject unprofitable or unsupported trades.
 
@@ -67,7 +67,7 @@ RPC_URL=
 
 WATCHLIST=1
 MIN_SIZE_ETH=0.002
-MAX_SIZE_ETH=0.005
+MAX_SIZE_ETH=0.002
 MIN_PROFIT_BPS=150
 SLIPPAGE_BPS=100
 GAS_UNITS=700000
@@ -110,7 +110,7 @@ The fast path remains serialized through the existing `serialRunner`; a burst of
 
 ## Sequencer flash-backrun mode
 
-The optional V3 path can fund the current RobinFun <-> V4 opportunity with a Morpho Blue WETH flash loan. It remains disabled unless `SEQUENCER_FLASH_MODE=1` and all deployed addresses/signers are supplied.
+The optional V4 path can fund the current RobinFun <-> V4 opportunity with a Morpho Blue WETH flash loan. It remains disabled unless `SEQUENCER_FLASH_MODE=1` (and live trading still needs `LIVE=1` plus the relayer/strategy keys). The five live contracts are listed below; `deployments.js` is used when the env vars are blank.
 
 Current verified dependencies used by `deploy:sequencer`:
 
@@ -131,9 +131,11 @@ Deployment is fail-closed and requires explicit Safe owner, strategy signer and 
 $env:SAFE_OWNER="0x..."
 $env:STRATEGY_SIGNER="0x..."
 $env:TREASURY="0x..."
-$env:MAX_BLOCK_WINDOW="2"
+$env:MAX_BLOCK_WINDOW="1"
 npm run deploy:sequencer
 ```
+
+Copy the five printed addresses into `.env` only if you deployed a **new** fail-closed copy. The already-live stack is listed above and in `deployments.js`.
 
 Deployment does not enable a relayer, adapter, token, pool or borrow cap. Those must be reviewed and enabled through the Safe before flash mode can execute.
 
@@ -157,6 +159,28 @@ EXECUTOR_ADDR=0x...
 ```
 
 The deployment starts with no allowed pools. Existing deployments from the original RobinArb contract are not ABI-compatible with this hardened executor.
+
+## Live contracts (Robinhood Chain 4663)
+
+These five contracts are already deployed and permissioned by `cktheghost.eth` (`0xB50516982524DFF3d8d563F46AD54891Aa61944E`). Addresses are also in `deployments.js` and `.env.example`.
+
+| Contract | Address | On-chain state (2026-09-20) |
+|---|---|---|
+| `SequencerFlashArbExecutorV4` | [`0x715c5B9eb7Aa86D65C098EBCF9E7AdDCa5A30ecc`](https://robinhoodchain.blockscout.com/address/0x715c5B9eb7Aa86D65C098EBCF9E7AdDCa5A30ecc) | Unpaused. ArbSys N+1 window. Relayer + both adapters enabled. WETH cap `0.002`. |
+| `RobinFunWethAdapter` | [`0xB196298aFDeC35d756aeDe74Ba453eF6062eC29b`](https://robinhoodchain.blockscout.com/address/0xB196298aFDeC35d756aeDe74Ba453eF6062eC29b) | RH6900 allowlisted. |
+| `UniswapV4WethAdapter` | [`0x0e62FFA0a3E3d418AA0eBE551d88367B6DC88c0b`](https://robinhoodchain.blockscout.com/address/0x0e62FFA0a3E3d418AA0eBE551d88367B6DC88c0b) | Both configured ETH/RH6900 PoolKeys allowlisted. |
+| `SequencerRouteQuoter` | [`0x7a43Dfa87935088705BEddF7A740c5c7E84ADaC9`](https://robinhoodchain.blockscout.com/address/0x7a43Dfa87935088705BEddF7A740c5c7E84ADaC9) | Wired to RobinFun + V4 quoter. |
+| `V4TickStateLens` | [`0xFA5dfA6084113A912C22E21Fbb9D8Eab334Db89C`](https://robinhoodchain.blockscout.com/address/0xFA5dfA6084113A912C22E21Fbb9D8Eab334Db89C) | Wired to V4 PoolManager. |
+
+Re-check any time with:
+
+```powershell
+npm run live-status
+```
+
+That command is read-only. It does not submit transactions. Flash live still needs `LIVE=1`, `SEQUENCER_FEED=1`, `SEQUENCER_FLASH_MODE=1`, `PRIVATE_KEY` (enabled relayer), and `STRATEGY_PRIVATE_KEY` (on-chain strategy signer). Size trades at or below the `0.002` WETH borrow cap. Morpho flash liquidity is used for the trade; the executor does not need its own WETH inventory.
+
+The flash executor anchors with ArbSys (`0x64`) `arbBlockNumber` / `arbBlockHash`, not Solidity `block.number`. Intents are valid only in L2 block N+1.
 
 ## Discover and review markets
 
@@ -328,10 +352,11 @@ Polling alerts can be noisy. Set `TELEGRAM_POLL_ALERTS=0` to disable them withou
 npm test
 npm run check
 npm run smoke
+npm run live-status
 npm audit
 ```
 
-`npm run check` runs syntax validation, seven automated tests, and deterministic Solidity compilation with `solc 0.8.26`.
+`npm run check` runs syntax validation, automated tests, and deterministic Solidity compilation with `solc 0.8.26`.
 
 ## Repository layout
 
@@ -349,7 +374,13 @@ npm audit
 | `executor-admin.js` | pause and unpause operations |
 | `provider.js` | private RPC selection and pinned-provider retry logic |
 | `telegram.js` | non-blocking operational and trade alerts |
-| `contracts/ArbExecutor.sol` | atomic executor and on-chain risk controls |
+| `contracts/ArbExecutor.sol` | legacy atomic executor |
+| `contracts/SequencerFlashArbExecutorV4.sol` | Morpho flash executor (ArbSys N+1) |
+| `contracts/adapters/` | RobinFun + Uniswap V4 WETH adapters |
+| `contracts/SequencerRouteQuoter.sol` | batched RobinFun/V4 quote helper |
+| `contracts/V4TickStateLens.sol` | bounded V4 tick/bitmap state hash |
+| `deployments.js` | live chain-4663 contract addresses |
+| `scripts/live-status.js` | read-only go-live check of the five contracts |
 | `deploy.js`, `deposit.js`, `withdraw.js` | executor lifecycle and funds |
 | `test/` | contract compile, PoolKey, risk, and scanner-output tests |
 
