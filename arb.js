@@ -27,6 +27,9 @@ import { bpsDown, buildGrid, envInteger, feeOverrides, serialRunner } from './ri
 import { SequencerFeedClient } from './sequencer-feed.js';
 import { createLatencyRecorder } from './latency.js';
 import { buildFlashIntent, genericStateCheck, signFlashIntent } from './flash-intent.js';
+import { DEPLOYMENTS, WETH as CANONICAL_WETH, envOrDeployed } from './deployments.js';
+import { FLASH_EXECUTOR_ABI, confirmAnchorHash, nextBlockValidity } from './l2-clock.js';
+import { feedTriggerTxHash } from './sequencer-codec.js';
 
 const EXECUTOR_ABI = [
   'function curveToV4(address token,uint256 ethIn,uint256 minTokensOut,(address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks) key,uint128 minEthOut,uint256 minProfit)',
@@ -37,10 +40,7 @@ const EXECUTOR_ABI = [
   'function paused() view returns (bool)',
 ];
 
-const FLASH_EXECUTOR_ABI = [
-  'function executeFlashArb((address settlementToken,uint256 borrowAmount,uint256 minProfit,uint256 maxGasPrice,uint64 validAfterBlock,uint64 validUntilBlock,uint64 deadline,uint256 nonce,bytes32 triggerTxHash,bytes32 routeHash,bytes32 stateChecksHash) intent,(address adapter,address tokenIn,address tokenOut,uint256 minOut,bytes data)[] legs,(uint8 mode,address target,bytes callData,bytes32 expectedReturnHash)[] checks,bytes signature)',
-];
-const WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';
+const WETH = CANONICAL_WETH;
 const CURVE_STATE = new Interface(CURVE_ABI);
 const V4_STATE = new Interface([
   'function getSlot0(bytes32 poolId) view returns (uint160 sqrtPriceX96,int24 tick,uint24 protocolFee,uint24 lpFee)',
@@ -53,8 +53,8 @@ if (CLI_LIVE && CLI_DRY_RUN) throw new Error('cannot combine --live and --dry-ru
 
 const CFG = {
   minSize: parseEther(process.env.MIN_SIZE_ETH || '0.002'),
-  maxSize: parseEther(process.env.MAX_SIZE_ETH || '0.005'),
-  minProfitBps: BigInt(envInteger('MIN_PROFIT_BPS', 150, { min: 1, max: 5000 })),
+  maxSize: parseEther(process.env.MAX_SIZE_ETH || '0.002'),
+  minProfitBps: BigInt(envInteger('MIN_PROFIT_BPS', 150, { min: 0, max: 5000 })),
   slippageBps: BigInt(envInteger('SLIPPAGE_BPS', 100, { min: 0, max: 2000 })),
   pollMs: envInteger('POLL_MS', 45000, { min: 1000, max: 3600000 }),
   eventPollMs: envInteger('EVENT_POLL_MS', 6000, { min: 1000, max: 60000 }),
@@ -70,11 +70,13 @@ const CFG = {
   sequencerLiveMaxAgeMs: envInteger('SEQUENCER_LIVE_MAX_AGE_MS', 5000, { min: 100, max: 60000 }),
   sequencerFilterMode: process.env.SEQUENCER_FILTER_MODE || 'targets',
   flashMode: process.env.SEQUENCER_FLASH_MODE === '1',
-  flashExecutor: process.env.SEQUENCER_EXECUTOR_ADDR || null,
-  curveAdapter: process.env.ROBIN_FUN_WETH_ADAPTER || null,
-  v4Adapter: process.env.UNISWAP_V4_WETH_ADAPTER || null,
+  flashExecutor: envOrDeployed('SEQUENCER_EXECUTOR_ADDR', DEPLOYMENTS.sequencerExecutor),
+  curveAdapter: envOrDeployed('ROBIN_FUN_WETH_ADAPTER', DEPLOYMENTS.robinFunWethAdapter),
+  v4Adapter: envOrDeployed('UNISWAP_V4_WETH_ADAPTER', DEPLOYMENTS.uniswapV4WethAdapter),
+  routeQuoter: envOrDeployed('ROUTE_QUOTER_ADDR', DEPLOYMENTS.routeQuoter),
+  tickLens: envOrDeployed('V4_TICK_STATE_LENS', DEPLOYMENTS.v4TickStateLens),
   flashGasUnits: BigInt(envInteger('FLASH_GAS_UNITS', 1500000, { min: 300000, max: 5000000 })),
-  flashBlockWindow: envInteger('FLASH_BLOCK_WINDOW', 2, { min: 1, max: 16 }),
+  flashBlockWindow: envInteger('FLASH_BLOCK_WINDOW', 1, { min: 1, max: 16 }),
   flashDeadlineSeconds: envInteger('FLASH_DEADLINE_SECONDS', 5, { min: 1, max: 60 }),
   sequencerMaxBlockLag: envInteger('SEQUENCER_MAX_BLOCK_LAG', 8, { min: 0, max: 1000 }),
   submitRpcUrl: process.env.SUBMIT_RPC_URL || (process.env.DIRECT_SEQUENCER_SUBMIT === '1'
@@ -175,6 +177,19 @@ async function main() {
     ? new Contract(CFG.flashExecutor, FLASH_EXECUTOR_ABI, execWallet)
     : null;
 
+  if (CFG.flashMode && !flashExecutor) {
+    for (const [name, address] of [
+      ['SEQUENCER_EXECUTOR_ADDR', CFG.flashExecutor],
+      ['ROBIN_FUN_WETH_ADAPTER', CFG.curveAdapter],
+      ['UNISWAP_V4_WETH_ADAPTER', CFG.v4Adapter],
+      ['ROUTE_QUOTER_ADDR', CFG.routeQuoter],
+      ['V4_TICK_STATE_LENS', CFG.tickLens],
+    ]) {
+      if (await provider.getCode(address) === '0x') throw new Error(`${name} has no contract code at ${address}`);
+    }
+    console.log('flash stack (read-only):', CFG.flashExecutor);
+  }
+
   if (executor) {
     const [rawChainId, code, owner, contractMax, isPaused] = await Promise.all([
       execProvider.send('eth_chainId', []), execProvider.getCode(CFG.executor), executor.owner(), executor.maxTradeSize(), executor.paused(),
@@ -193,6 +208,55 @@ async function main() {
     const capital = await execProvider.getBalance(CFG.executor);
     if (capital < CFG.minSize && CFG.live && markets.length) throw new Error(`executor balance ${formatEther(capital)} is below MIN_SIZE_ETH`);
     if (capital < CFG.minSize) console.warn(`WARNING: executor balance ${formatEther(capital)} is below MIN_SIZE_ETH`);
+  }
+
+  let flashCurveAdapter = null;
+  let flashV4Adapter = null;
+  if (flashExecutor) {
+    flashCurveAdapter = new Contract(CFG.curveAdapter, ['function allowedTokens(address) view returns (bool)'], execProvider);
+    flashV4Adapter = new Contract(CFG.v4Adapter, ['function allowedPools(bytes32) view returns (bool)'], execProvider);
+    const [rawChainId, code, paused, relayerOk, curveOk, v4Ok, cap, window, delay] = await Promise.all([
+      execProvider.send('eth_chainId', []),
+      execProvider.getCode(CFG.flashExecutor),
+      flashExecutor.paused(),
+      wallet ? flashExecutor.relayers(wallet.address) : Promise.resolve(false),
+      flashExecutor.adapters(CFG.curveAdapter),
+      flashExecutor.adapters(CFG.v4Adapter),
+      flashExecutor.borrowCaps(WETH),
+      flashExecutor.maxBlockWindow(),
+      flashExecutor.maxAnchorDelay(),
+    ]);
+    if (Number(BigInt(rawChainId)) !== 4663) throw new Error(`execution RPC is on wrong chain ${rawChainId}`);
+    if (code === '0x') throw new Error('SEQUENCER_EXECUTOR_ADDR has no contract code');
+    if (paused && CFG.live) throw new Error('flash executor is paused; run npm run unpause after review');
+    if (paused) console.warn('WARNING: flash executor is paused (monitoring only)');
+    if (CFG.live && !relayerOk) throw new Error('wallet is not an enabled flash relayer');
+    if (!curveOk || !v4Ok) throw new Error('live adapters are not enabled on the flash executor');
+    if (window !== 1n || delay !== 1n) {
+      console.warn(`WARNING: executor window=${window} delay=${delay}; this bot submits strict N+1 intents`);
+    }
+    if (cap === 0n && CFG.live) throw new Error('WETH borrow cap is 0; flash borrows are disabled');
+    if (cap > 0n && cap < CFG.maxSize) {
+      console.warn(`WARNING: clamping MAX_SIZE_ETH to WETH borrow cap ${formatEther(cap)}`);
+      CFG.maxSize = cap;
+      if (CFG.minSize > CFG.maxSize) CFG.minSize = CFG.maxSize;
+    }
+    const tokenOk = await Promise.all(markets.map(async (m) => ({
+      ...m,
+      allowed: await flashCurveAdapter.allowedTokens(m.token).catch(() => false),
+      pools: (await Promise.all(m.pools.map(async (p) =>
+        (await flashV4Adapter.allowedPools(p.id).catch(() => false)) ? p : null))).filter(Boolean),
+    })));
+    markets = tokenOk.filter((m) => m.allowed && m.pools.length);
+    if (!markets.length) console.warn('WARNING: no adapter-allowlisted flash markets; discovery listener only');
+    if (CFG.live && process.env.STRATEGY_PRIVATE_KEY) {
+      const signer = new Wallet(process.env.STRATEGY_PRIVATE_KEY).address;
+      const onchain = await flashExecutor.strategySigner();
+      if (signer.toLowerCase() !== onchain.toLowerCase()) {
+        throw new Error(`STRATEGY_PRIVATE_KEY ${signer} is not the on-chain strategy signer ${onchain}`);
+      }
+    }
+    console.log(`flash stack: executor=${CFG.flashExecutor} cap=${formatEther(cap)} WETH`);
   }
 
   let gasPolicy = feeOverrides(await execProvider.getFeeData(), CFG.gasUnits, CFG.gasBufferBps);
@@ -285,16 +349,13 @@ async function main() {
   async function executeFlash(b, sequencerContext) {
     if (!flashExecutor) throw new Error('sequencer flash executor unavailable');
     if (!process.env.STRATEGY_PRIVATE_KEY) throw new Error('STRATEGY_PRIVATE_KEY missing');
-    if (!sequencerContext?.triggerTxHash || !sequencerContext?.sequenceNumber) {
-      throw new Error('missing sequencer trigger context');
+    if (!sequencerContext?.triggerTxHash || sequencerContext.anchorBlock == null || !sequencerContext.anchorBlockHash) {
+      throw new Error('missing sequencer anchor context');
     }
 
-    const targetBlock = BigInt(sequencerContext.sequenceNumber);
-    const head = BigInt(await provider.getBlockNumber());
-    if (head < targetBlock) throw new Error(`fast RPC behind sequencer target: head=${head} target=${targetBlock}`);
-    if (head - targetBlock > BigInt(CFG.sequencerMaxBlockLag)) {
-      throw new Error(`sequencer opportunity stale by ${head - targetBlock} blocks`);
-    }
+    const anchorBlock = BigInt(sequencerContext.anchorBlock);
+    await confirmAnchorHash(provider, anchorBlock, sequencerContext.anchorBlockHash);
+    const { validAfterBlock, validUntilBlock } = nextBlockValidity(anchorBlock);
 
     const minProfit = (b.size * CFG.minProfitBps) / 10000n + b.gasCost;
     const finalMin = b.size + minProfit;
@@ -320,8 +381,10 @@ async function main() {
       borrowAmount: b.size,
       minProfit,
       maxGasPrice,
-      validAfterBlock: head,
-      validUntilBlock: head + BigInt(CFG.flashBlockWindow),
+      anchorBlock,
+      anchorBlockHash: sequencerContext.anchorBlockHash,
+      validAfterBlock,
+      validUntilBlock,
       deadline: BigInt(Math.floor(Date.now() / 1000) + CFG.flashDeadlineSeconds),
       nonce,
       triggerTxHash: sequencerContext.triggerTxHash,
@@ -352,8 +415,8 @@ async function main() {
     const submittedAt = Date.now();
     latency.record('flash-submitted', {
       triggerTxHash: sequencerContext.triggerTxHash,
-      targetBlock: targetBlock.toString(),
-      stateBlock: head.toString(),
+      targetBlock: validUntilBlock.toString(),
+      stateBlock: anchorBlock.toString(),
       symbol: b.market.symbol,
       direction: b.dir,
       txHash,
@@ -410,6 +473,10 @@ async function main() {
             console.log('    (idle: sequencer flash mode only executes sequencer-triggered opportunities)');
             return;
           }
+          if (!lastSequencerContext?.anchorBlockHash) {
+            console.log('    (idle: sequencer batch missing L2 anchor hash)');
+            return;
+          }
           await executeFlash(b, lastSequencerContext);
         } else {
           await execute(b);
@@ -463,15 +530,19 @@ async function main() {
         if (CFG.flashMode && matched.length === 0) return;
 
         const targetTx = matched.length ? matched[matched.length - 1] : batch.transactions[batch.transactions.length - 1];
-        const triggerTxHash = targetTx?.raw ? keccak256(targetTx.raw) : null;
+        const triggerTxHash = feedTriggerTxHash(targetTx);
         lastSequencerContext = {
           receivedAt: batch.receivedAt,
           sequenceNumber: targetTx?.sequenceNumber || batch.lastSequenceNumber,
+          anchorBlock: batch.anchorBlock || batch.lastSequenceNumber,
+          anchorBlockHash: batch.anchorBlockHash || null,
+          quality: batch.quality || null,
           triggerTxHash,
           to: targetTx?.to || null,
           selector: targetTx?.selector || null,
           valueWei: targetTx?.valueWei || '0',
         };
+        if (CFG.flashMode && !lastSequencerContext.anchorBlockHash) return;
 
         const now = Date.now();
         if (now - lastSequencerTriggerAt < CFG.sequencerTriggerMinMs) return;
@@ -544,6 +615,17 @@ async function main() {
         console.log(`NEW POOL PENDING ALLOWLIST: ${sym} @ ${pool.name} (${c1})`);
         await tg(`🛡️ <b>New pool pending approval</b>: ${sym} @ ${pool.name} — run npm run allow-pools after review`);
         return;
+      }
+      if (flashV4Adapter) {
+        const poolAllowed = await flashV4Adapter.allowedPools(poolId).catch(() => false);
+        const tokenAllowed = flashCurveAdapter
+          ? await flashCurveAdapter.allowedTokens(c1).catch(() => false)
+          : false;
+        if (!poolAllowed || !tokenAllowed) {
+          console.log(`NEW POOL PENDING FLASH ALLOWLIST: ${sym} @ ${pool.name} (${c1})`);
+          await tg(`🛡️ <b>New pool pending flash adapter approval</b>: ${sym} @ ${pool.name} — owner must allowlist after review`);
+          return;
+        }
       }
       let m = markets.find(x => x.token.toLowerCase() === c1.toLowerCase());
       if (m) {

@@ -31,6 +31,7 @@ test('sequencer feed parses Nitro broadcast envelopes and tracks sequence', asyn
     WebSocketImpl: FakeWebSocket,
     now: () => now,
     idleTimeoutMs: 60000,
+    verifySignatures: false,
     onBatch: (b) => batches.push(b),
     onStatus: (s) => statuses.push(s.type),
   });

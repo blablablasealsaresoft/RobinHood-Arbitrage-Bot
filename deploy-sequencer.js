@@ -1,111 +1,108 @@
-// deploy-sequencer.js — deploy SequencerFlashArbExecutorV3 + WETH adapters.
-// Deployment only. It does NOT enable relayers, adapters, pools or borrow caps.
-//
-// Required:
-//   PRIVATE_KEY=deployment wallet
-//   SAFE_OWNER=Safe/multisig owner of all deployed contracts
-//   STRATEGY_SIGNER=hot EIP-712 strategy-signing key
-//   TREASURY=profit receiver
-//
-// Optional:
-//   EXEC_RPC_URL / RPC_URL
-//   MAX_BLOCK_WINDOW=2
-
+// deploy-sequencer.js — deploy the V4 next-block flash-arb stack fail-closed.
+// Deploys the same five contracts as the live 2026-09-20 stack:
+//   SequencerFlashArbExecutorV4, RobinFunWethAdapter, UniswapV4WethAdapter,
+//   SequencerRouteQuoter, V4TickStateLens.
+// Deployment does NOT enable relayers, adapters, tokens, pools, or borrow caps.
 import 'dotenv/config';
 import fs from 'node:fs';
 import { ContractFactory, JsonRpcProvider, Network, Wallet, getAddress } from 'ethers';
 import { CURVE, V4 } from './config.js';
+import { DEPLOYMENTS, MORPHO_BLUE, WETH } from './deployments.js';
 
 const CHAIN_ID = 4663;
-const MORPHO_BLUE = '0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010';
-const WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73';
 
-function required(name) {
+const required = (name) => {
   const value = process.env[name];
-  if (!value) throw new Error(`set ${name}`);
-  return value;
-}
+  if (!value) throw new Error(`${name} is required`);
+  return getAddress(value);
+};
+const artifact = (name) =>
+  JSON.parse(fs.readFileSync(new URL(`./build/${name}.json`, import.meta.url)));
 
-function artifact(name) {
-  return JSON.parse(fs.readFileSync(new URL(`./build/${name}.json`, import.meta.url)));
-}
-
-async function deploy(factory, args, label) {
-  console.log('deploying', label, '...');
+async function deploy(factory, args, name) {
+  console.log('deploying', name);
   const contract = await factory.deploy(...args);
   await contract.waitForDeployment();
   const address = await contract.getAddress();
-  console.log(label, address);
+  console.log(name, address);
   return address;
 }
 
 async function main() {
-  const privateKey = required('PRIVATE_KEY');
-  const safeOwner = getAddress(required('SAFE_OWNER'));
-  const strategySigner = getAddress(required('STRATEGY_SIGNER'));
-  const treasury = getAddress(required('TREASURY'));
-  const maxBlockWindow = Number(process.env.MAX_BLOCK_WINDOW || '2');
-  if (!Number.isInteger(maxBlockWindow) || maxBlockWindow < 1 || maxBlockWindow > 64) {
-    throw new Error('MAX_BLOCK_WINDOW must be 1..64');
-  }
-
-  const rpcUrl = process.env.EXEC_RPC_URL || process.env.RPC_URL || 'https://rpc.mainnet.chain.robinhood.com';
+  if (!process.env.PRIVATE_KEY) throw new Error('PRIVATE_KEY is required');
+  const rpc = process.env.EXEC_RPC_URL || process.env.RPC_URL || 'https://rpc.mainnet.chain.robinhood.com';
   const network = new Network('robinhood', CHAIN_ID);
-  const provider = new JsonRpcProvider(rpcUrl, network, { staticNetwork: network });
-  const wallet = new Wallet(privateKey, provider);
-  const chain = await provider.send('eth_chainId', []);
-  if (Number(BigInt(chain)) !== CHAIN_ID) throw new Error(`wrong chain ${chain}`);
+  const provider = new JsonRpcProvider(rpc, network, { staticNetwork: network });
+  const wallet = new Wallet(process.env.PRIVATE_KEY, provider);
+
+  const owner = required('SAFE_OWNER');
+  const signer = process.env.STRATEGY_PRIVATE_KEY
+    ? new Wallet(process.env.STRATEGY_PRIVATE_KEY).address
+    : required('STRATEGY_SIGNER');
+  const treasury = required(process.env.TREASURY_ADDR ? 'TREASURY_ADDR' : 'TREASURY');
+  const morpho = getAddress(process.env.MORPHO_ADDR || MORPHO_BLUE);
+  const weth = getAddress(process.env.WETH_ADDR || WETH);
 
   for (const [label, address] of [
-    ['Morpho Blue', MORPHO_BLUE],
-    ['WETH', WETH],
+    ['Morpho', morpho],
     ['RobinFun curve', CURVE.address],
-    ['Universal Router', V4.universalRouter],
+    ['WETH', weth],
+    ['V4 router', V4.universalRouter],
     ['Permit2', V4.permit2],
+    ['V4 quoter', V4.quoter],
+    ['V4 poolManager', V4.poolManager],
   ]) {
-    const code = await provider.getCode(address);
-    if (code === '0x') throw new Error(`${label} has no code at ${address}`);
+    if (await provider.getCode(address) === '0x') throw new Error(`${label} has no code at ${address}`);
   }
 
   console.log('deployer', wallet.address);
-  console.log('owner', safeOwner);
-  console.log('strategy signer', strategySigner);
+  console.log('owner', owner);
+  console.log('strategy signer', signer);
   console.log('treasury', treasury);
-
-  const executorArtifact = artifact('SequencerFlashArbExecutorV3');
-  const curveArtifact = artifact('RobinFunWethAdapter');
-  const v4Artifact = artifact('UniswapV4WethAdapter');
+  console.log('existing live stack is documented in deployments.js; this run creates a NEW fail-closed copy');
 
   const executor = await deploy(
-    new ContractFactory(executorArtifact.abi, executorArtifact.bytecode, wallet),
-    [safeOwner, strategySigner, treasury, MORPHO_BLUE, maxBlockWindow],
-    'SequencerFlashArbExecutorV3',
+    new ContractFactory(artifact('SequencerFlashArbExecutorV4').abi, artifact('SequencerFlashArbExecutorV4').bytecode, wallet),
+    [owner, signer, treasury, morpho, 1, 1],
+    'SequencerFlashArbExecutorV4',
   );
-
   const curveAdapter = await deploy(
-    new ContractFactory(curveArtifact.abi, curveArtifact.bytecode, wallet),
-    [safeOwner, CURVE.address, WETH],
+    new ContractFactory(artifact('RobinFunWethAdapter').abi, artifact('RobinFunWethAdapter').bytecode, wallet),
+    [owner, CURVE.address, weth],
     'RobinFunWethAdapter',
   );
-
   const v4Adapter = await deploy(
-    new ContractFactory(v4Artifact.abi, v4Artifact.bytecode, wallet),
-    [safeOwner, WETH, V4.permit2, V4.universalRouter],
+    new ContractFactory(artifact('UniswapV4WethAdapter').abi, artifact('UniswapV4WethAdapter').bytecode, wallet),
+    [owner, weth, V4.permit2, V4.universalRouter],
     'UniswapV4WethAdapter',
   );
+  const routeQuoter = await deploy(
+    new ContractFactory(artifact('SequencerRouteQuoter').abi, artifact('SequencerRouteQuoter').bytecode, wallet),
+    [CURVE.address, V4.quoter],
+    'SequencerRouteQuoter',
+  );
+  const tickLens = await deploy(
+    new ContractFactory(artifact('V4TickStateLens').abi, artifact('V4TickStateLens').bytecode, wallet),
+    [V4.poolManager],
+    'V4TickStateLens',
+  );
 
-  console.log('\nDEPLOYED — FAIL-CLOSED');
-  console.log('No relayer is enabled.');
-  console.log('No executor adapter is enabled.');
-  console.log('No settlement-token borrow cap is enabled.');
-  console.log('No curve token or V4 pool is enabled.');
-  console.log('\nAdd these to your private deployment notes:');
+  console.log('\nDEPLOYED FAIL-CLOSED');
+  console.log('The owner must explicitly enable the relayer, both adapters, WETH borrow cap,');
+  console.log('the RobinFun token, and the reviewed V4 PoolKeys before LIVE.');
+  console.log('\nCurrent live (already configured) addresses:');
+  console.log(`SEQUENCER_EXECUTOR_ADDR=${DEPLOYMENTS.sequencerExecutor}`);
+  console.log(`ROBIN_FUN_WETH_ADAPTER=${DEPLOYMENTS.robinFunWethAdapter}`);
+  console.log(`UNISWAP_V4_WETH_ADAPTER=${DEPLOYMENTS.uniswapV4WethAdapter}`);
+  console.log(`ROUTE_QUOTER_ADDR=${DEPLOYMENTS.routeQuoter}`);
+  console.log(`V4_TICK_STATE_LENS=${DEPLOYMENTS.v4TickStateLens}`);
+  console.log('\nThis new deployment:');
   console.log(`SEQUENCER_EXECUTOR_ADDR=${executor}`);
   console.log(`ROBIN_FUN_WETH_ADAPTER=${curveAdapter}`);
   console.log(`UNISWAP_V4_WETH_ADAPTER=${v4Adapter}`);
-  console.log(`MORPHO_BLUE=${MORPHO_BLUE}`);
-  console.log(`WETH=${WETH}`);
-  console.log('\nNext step is Safe-admin configuration + fork validation, not LIVE mode.');
+  console.log(`ROUTE_QUOTER_ADDR=${routeQuoter}`);
+  console.log(`V4_TICK_STATE_LENS=${tickLens}`);
+  console.log(`MORPHO_ADDR=${morpho}`);
 }
 
 main().catch((error) => {

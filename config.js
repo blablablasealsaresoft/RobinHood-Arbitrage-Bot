@@ -72,3 +72,6 @@ export const POOL_ID = POOLS[0].id;
 
 // Native ETH pseudo-address used by the curve/V4 for the ETH side.
 export const NATIVE = '0x0000000000000000000000000000000000000000';
+
+// Canonical Robinhood WETH used by Morpho flash settlement and the live adapters.
+export { WETH, MORPHO_BLUE } from './deployments.js';
